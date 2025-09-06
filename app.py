@@ -335,4 +335,39 @@ with left:
 with right:
     st.markdown("**Top by Bonus % (min 100 units)**")
     t2 = agg[agg["Qty Purchased"] >= 100].sort_values("Bonus %", ascending=False).head(10)[
-        ["Code", "Product", "Qty Purchased", "Bon]()
+        ["Code", "Product", "Qty Purchased", "Bonus Received",
+         "Times Purchased", "Avg Days Between", "Bonus %"]
+    ]
+    st.dataframe(t2, use_container_width=True, hide_index=True)
+
+st.divider()
+
+# -------------------------------------------------
+# Detailed Products table
+# -------------------------------------------------
+st.subheader(f"Detailed Products ({len(agg):,})")
+cols = [
+    "Code","Product","Qty Purchased","Bonus Received",
+    "Times Purchased","Times Bonus","Avg Purchase Qty","Avg Bonus Qty",
+    "Avg Days Between","Bonus %"
+]
+present = [c for c in cols if c in agg.columns]
+st.dataframe(
+    agg[present].sort_values("Qty Purchased", ascending=False),
+    use_container_width=True, hide_index=True
+)
+
+# Raw transactions (filtered) with DD/MM/YYYY display
+with st.expander("🔎 View raw transactions (filtered)"):
+    show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %"]
+    show_cols = [c for c in show_cols if c in tx_f.columns]
+    tx_show = tx_f[show_cols].copy()
+    if "Date" in tx_show.columns:
+        tx_show["_sort_date"] = tx_show["Date"]  # for correct sort
+        tx_show["Date"] = tx_show["Date"].dt.strftime(DATE_FMT_DISPLAY)
+        tx_show = tx_show.sort_values(["Product", "_sort_date"]).drop(columns=["_sort_date"])
+    st.dataframe(tx_show, use_container_width=True, hide_index=True)
+
+# Download summary
+csv_agg = agg[present].to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download product summary (CSV)", csv_agg, "product_summary.csv", "text/csv")
