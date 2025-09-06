@@ -120,4 +120,29 @@ def load_transactions():
 tx = load_transactions()
 
 st.title("📊 Purchase Dashboard")
-st.capt
+st.caption("ℹ️ Data available from **01/08/2024** onward.")
+
+if tx.empty or "Date" not in tx.columns:
+    st.warning("No data found or 'Date' column missing. Check sharing, tab gid, or column names.")
+    st.stop()
+
+# -------------------------------------------------
+# Sidebar Filters (DATE + SUPPLIER dropdown + search)
+# -------------------------------------------------
+with st.sidebar:
+    st.header("Filters")
+
+    # Date bounds (respect earliest available)
+    data_min = tx["Date"].min()
+    data_max = tx["Date"].max()
+    min_allowed = max(EARLIEST_AVAILABLE, data_min) if pd.notna(data_min) else EARLIEST_AVAILABLE
+    max_allowed = data_max if pd.notna(data_max) else pd.Timestamp.today().normalize()
+
+    default_range = (min_allowed.date(), max_allowed.date())
+    date_range = st.date_input(
+        "Date range (dd/mm/yyyy)",
+        value=default_range,
+        min_value=min_allowed.date(),
+        max_value=max_allowed.date(),
+    )
+    if isinsta
