@@ -127,7 +127,7 @@ if tx.empty or "Date" not in tx.columns:
     st.stop()
 
 # -------------------------------------------------
-# Sidebar Filters (DATE + SUPPLIER + search)
+# Sidebar Filters (DATE + SUPPLIER dropdown + search)
 # -------------------------------------------------
 with st.sidebar:
     st.header("Filters")
@@ -151,12 +151,15 @@ with st.sidebar:
         start_date = pd.Timestamp(date_range)
         end_date = start_date
 
-    # NEW: Supplier filter
+    # Supplier DROPDOWN (single select)
     sup_series = tx.get("Supplier Name", pd.Series("", index=tx.index)).astype(str).str.strip()
     supplier_options = sorted([s for s in sup_series.unique() if s])
-    selected_suppliers = st.multiselect(
-        "Supplier(s)", options=supplier_options, default=supplier_options,
-        help="Filter transactions by supplier. Defaults to all."
+    supplier_dropdown_options = ["All suppliers"] + supplier_options
+    selected_supplier = st.selectbox(
+        "Supplier",
+        options=supplier_dropdown_options,
+        index=0,
+        help="Choose a single supplier or 'All suppliers'."
     )
 
     q = st.text_input("Search (code or product)", "")
@@ -175,9 +178,9 @@ start_norm = start_date.normalize()
 end_norm   = end_date.normalize()
 mask_tx = (tx["Date"] >= start_norm) & (tx["Date"] <= end_norm)
 
-# Supplier filter (treat empty selection as 'all' to avoid accidental blank state)
-if selected_suppliers and len(selected_suppliers) < len(supplier_options):
-    mask_tx &= sup_series.isin(selected_suppliers)
+# Apply supplier dropdown
+if selected_supplier != "All suppliers":
+    mask_tx &= (sup_series == selected_supplier)
 
 if q.strip():
     ql = q.strip().lower()
@@ -233,7 +236,7 @@ elif bonus_filter == "Without Bonus":
 agg = agg[agg["Qty Purchased"] >= min_qty]
 
 if agg.empty:
-    st.info("No products after applying filters. Try adjusting supplier selection, date range, or Min Qty.")
+    st.info("No products after applying filters. Try adjusting supplier, date range, or Min Qty.")
     st.stop()
 
 # -------------------------------------------------
@@ -332,39 +335,4 @@ with left:
 with right:
     st.markdown("**Top by Bonus % (min 100 units)**")
     t2 = agg[agg["Qty Purchased"] >= 100].sort_values("Bonus %", ascending=False).head(10)[
-        ["Code", "Product", "Qty Purchased", "Bonus Received",
-         "Times Purchased", "Avg Days Between", "Bonus %"]
-    ]
-    st.dataframe(t2, use_container_width=True, hide_index=True)
-
-st.divider()
-
-# -------------------------------------------------
-# Detailed Products table
-# -------------------------------------------------
-st.subheader(f"Detailed Products ({len(agg):,})")
-cols = [
-    "Code","Product","Qty Purchased","Bonus Received",
-    "Times Purchased","Times Bonus","Avg Purchase Qty","Avg Bonus Qty",
-    "Avg Days Between","Bonus %"
-]
-present = [c for c in cols if c in agg.columns]
-st.dataframe(
-    agg[present].sort_values("Qty Purchased", ascending=False),
-    use_container_width=True, hide_index=True
-)
-
-# Raw transactions (filtered) with DD/MM/YYYY display
-with st.expander("🔎 View raw transactions (filtered)"):
-    show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %"]
-    show_cols = [c for c in show_cols if c in tx_f.columns]
-    tx_show = tx_f[show_cols].copy()
-    if "Date" in tx_show.columns:
-        tx_show["_sort_date"] = tx_show["Date"]  # for correct sort
-        tx_show["Date"] = tx_show["Date"].dt.strftime(DATE_FMT_DISPLAY)
-        tx_show = tx_show.sort_values(["Product", "_sort_date"]).drop(columns=["_sort_date"])
-    st.dataframe(tx_show, use_container_width=True, hide_index=True)
-
-# Download summary
-csv_agg = agg[present].to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Download product summary (CSV)", csv_agg, "product_summary.csv", "text/csv")
+        ["Code", "Product", "Qty Purchased", "Bon]()
