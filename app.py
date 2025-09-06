@@ -14,9 +14,9 @@ GID      = 0  # change if your data tab is not the first
 RANGE    = "Sheet1!A1:G100000"   # A..G = Supplier..Bonus %
 CSV_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
 
-# Earliest available data + display format
-EARLIEST_AVAILABLE = pd.Timestamp(2024, 8, 1)   # 01/08/2024
-DATE_FMT_DISPLAY   = "%d/%m/%Y"                 # dd/mm/yyyy
+# Earliest available data + display format  (MM/DD/YYYY)
+EARLIEST_AVAILABLE = pd.Timestamp(2024, 8, 1)   # 08/01/2024
+DATE_FMT_DISPLAY   = "%m/%d/%Y"                 # mm/dd/yyyy
 
 # -------------------------------------------------
 # Helpers
@@ -39,22 +39,41 @@ def avg_gap_days(s: pd.Series) -> float:
     diffs = dates.diff().dt.days.dropna()
     return float(diffs.mean())
 
-def parse_dates_ddmmyyyy(col: pd.Series) -> pd.Series:
+def parse_dates_force_mdy(raw_col: pd.Series) -> pd.Series:
     """
-    Robust dd/mm/yyyy parser:
-    - trims, replaces non-breaking spaces
-    - tries dayfirst=True
-    - retries with '-' swapped to '/' if needed
-    - normalizes to midnight
+    Enforce MM/DD/YYYY semantics and handle:
+      - '8/11/2024', '08-11-2024', '08.11.2024', '8/11/24'
+      - ISO '2024-11-08'
+      - Google/Excel serial numbers (e.g., 45678)
+    Returns (parsed_Timestamps, original_strings)
     """
-    s = col.astype(str).str.strip().str.replace("\u00A0", " ", regex=False)
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-    mask = dt.isna() & s.notna()
+    s_raw = raw_col.astype(str)
+
+    # Clean NBSP, trim, normalize separators
+    s = (
+        s_raw.str.replace("\u00A0", " ", regex=False)  # NBSP
+             .str.strip()
+             .str.replace(".", "/", regex=False)        # 08.11.2024 -> 08/11/2024
+    )
+
+    # Try month-first directly
+    dt1 = pd.to_datetime(s, errors="coerce", dayfirst=False)
+
+    # Retry after '-' -> '/'
+    mask = dt1.isna()
     if mask.any():
         s2 = s.str.replace("-", "/", regex=False)
-        dt2 = pd.to_datetime(s2, errors="coerce", dayfirst=True)
-        dt.loc[mask] = dt2.loc[mask]
-    return dt.dt.normalize()
+        dt2 = pd.to_datetime(s2, errors="coerce", dayfirst=False)
+        dt1.loc[mask] = dt2.loc[mask]
+
+    # Excel/Sheets serial numbers (vectorized)
+    serial = pd.to_numeric(s, errors="coerce")
+    serial_mask = serial.notna() & (dt1.isna())
+    if serial_mask.any():
+        dt_serial = pd.to_datetime(serial, unit="D", origin="1899-12-30", errors="coerce")
+        dt1.loc[serial_mask] = dt_serial.loc[serial_mask]
+
+    return dt1.dt.normalize(), s_raw
 
 # -------------------------------------------------
 # Load data (API -> CSV fallback)
@@ -98,9 +117,11 @@ def load_transactions():
             rename_map[c] = "Qty Purchased"
     df = df.rename(columns=rename_map)
 
-    # Parse Date (strict dd/mm/yyyy behavior)
+    # Parse Date (force MM/DD/YYYY semantics)
     if "Date" in df.columns:
-        df["Date"] = parse_dates_ddmmyyyy(df["Date"])
+        parsed, date_raw = parse_dates_force_mdy(df["Date"])
+        df["_Date_raw"] = date_raw
+        df["Date"] = parsed
 
     # Numeric columns
     for c in ["Qty Purchased", "Bonus"]:
@@ -120,11 +141,18 @@ def load_transactions():
 tx = load_transactions()
 
 st.title("📊 Purchase Dashboard")
-st.caption("ℹ️ Data available from **01/08/2024** onward.")
+st.caption("ℹ️ Data available from **08/01/2024** onward.")
 
 if tx.empty or "Date" not in tx.columns:
     st.warning("No data found or 'Date' column missing. Check sharing, tab gid, or column names.")
     st.stop()
+
+# ---- Date diagnostics (show offenders if any failed)
+parse_fail = tx["Date"].isna().sum()
+if parse_fail > 0:
+    bad = tx.loc[tx["Date"].isna(), "_Date_raw"].value_counts().head(10)
+    with st.expander(f"⚠️ {parse_fail} rows have unparseable dates — click to view examples"):
+        st.write(bad)
 
 # -------------------------------------------------
 # Sidebar Filters (DATE + SUPPLIER dropdown + search)
@@ -133,14 +161,14 @@ with st.sidebar:
     st.header("Filters")
 
     # Date bounds (respect earliest available)
-    data_min = tx["Date"].min()
-    data_max = tx["Date"].max()
+    data_min = tx["Date"].min(skipna=True)
+    data_max = tx["Date"].max(skipna=True)
     min_allowed = max(EARLIEST_AVAILABLE, data_min) if pd.notna(data_min) else EARLIEST_AVAILABLE
     max_allowed = data_max if pd.notna(data_max) else pd.Timestamp.today().normalize()
 
     default_range = (min_allowed.date(), max_allowed.date())
     date_range = st.date_input(
-        "Date range (dd/mm/yyyy)",
+        "Date range (mm/dd/yyyy)",
         value=default_range,
         min_value=min_allowed.date(),
         max_value=max_allowed.date(),
@@ -176,7 +204,7 @@ st.caption(
 # Transaction-level mask (DATE + SUPPLIER + SEARCH)
 start_norm = start_date.normalize()
 end_norm   = end_date.normalize()
-mask_tx = (tx["Date"] >= start_norm) & (tx["Date"] <= end_norm)
+mask_tx = tx["Date"].notna() & (tx["Date"] >= start_norm) & (tx["Date"] <= end_norm)
 
 if selected_supplier != "All suppliers":
     mask_tx &= (sup_series == selected_supplier)
@@ -339,7 +367,7 @@ if not top_by_qty.empty:
     fig_bar.update_layout(
         yaxis=dict(categoryorder="total ascending", automargin=True),
         legend_title="", bargap=0.15,
-        margin=dict(l=10, r=60, t=30, b=10)  # more right padding for labels
+        margin=dict(l=10, r=60, t=30, b=10)
     )
     fig_bar.update_traces(hovertemplate="%{y}<br>%{legendgroup}: %{x:,.0f}",
                           cliponaxis=False)
@@ -347,7 +375,7 @@ if not top_by_qty.empty:
     # ✅ Show value labels ONLY on "Bonus Received" bars
     for tr in fig_bar.data:
         if tr.name == "Bonus Received":
-            tr.text = [f"{v:,.0f}" for v in tr.x]  # or :,.1f for one decimal
+            tr.text = [f"{v:,.0f}" for v in tr.x]
             tr.textposition = "outside"
             tr.texttemplate = "%{text}"
             tr.textfont = dict(size=12)
@@ -457,7 +485,7 @@ cols = [
 ]
 present = [c for c in cols if c in agg.columns]
 st.dataframe(
-    agg[present].sort_values("Qty Purchased", ascending=False),
+    agg[present].sort_values("Qty Purchased", descending=True if hasattr(pd.DataFrame.sort_values, '__call__') else False),
     use_container_width=True, hide_index=True,
     column_config={
         "Qty Purchased": st.column_config.NumberColumn(format="%,d"),
@@ -548,7 +576,7 @@ if selected_sku != "(Choose a product)":
     )
 
 # -------------------------------------------------
-# Raw transactions (filtered) with DD/MM/YYYY display
+# Raw transactions (filtered) with MM/DD/YYYY display
 # -------------------------------------------------
 with st.expander("🧾 View all filtered transactions"):
     show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %"]
