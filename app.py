@@ -8,15 +8,15 @@ import plotly.express as px
 # -------------------------------------------------
 st.set_page_config(page_title="Purchase Dashboard", layout="wide")
 
-# ---- Google Sheet config (edit these if needed)
+# ---- Google Sheet config
 SHEET_ID = "1R7o4xKMeYWcYWwAOorMyYDtjg0-74FqDK0xAFKN6Iuo"
 GID      = 0  # change if your data tab is not the first
 RANGE    = "Sheet1!A1:G100000"   # A..G = Supplier..Bonus %
 CSV_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
 
-# Earliest available data (banner + min date)
-EARLIEST_AVAILABLE = pd.Timestamp(2024, 8, 1)  # 01/08/2024
-DATE_FMT_DISPLAY = "%d/%m/%Y"                  # dd/mm/yyyy
+# Earliest available data + display format
+EARLIEST_AVAILABLE = pd.Timestamp(2024, 8, 1)   # 01/08/2024
+DATE_FMT_DISPLAY   = "%d/%m/%Y"                 # dd/mm/yyyy
 
 # -------------------------------------------------
 # Helpers
@@ -27,12 +27,11 @@ def short_label(code, name, n=40):
 
 def avg_gap_days(s: pd.Series) -> float:
     """
-    Average days between purchases for a product.
-    Uses sorted UNIQUE dates to avoid multiple transactions on the same day
-    creating zero gaps.
+    Average days between purchases for a product (unique dates only).
+    Assumes s is already datetime64[ns].
     """
     dates = (
-        pd.to_datetime(s, errors="coerce", dayfirst=True)
+        pd.to_datetime(s, errors="coerce")
         .dropna()
         .dt.normalize()
         .drop_duplicates()
@@ -43,11 +42,34 @@ def avg_gap_days(s: pd.Series) -> float:
     diffs = dates.diff().dt.days.dropna()
     return float(diffs.mean())
 
+def parse_dates_ddmmyyyy(col: pd.Series) -> pd.Series:
+    """
+    Robust dd/mm/yyyy parser:
+    - trims, replaces non-breaking spaces
+    - tries dayfirst=True
+    - retries with '-' swapped to '/' if needed
+    - normalizes to midnight
+    """
+    s = col.astype(str).str.strip().str.replace("\u00A0", " ", regex=False)
+
+    # primary parse: dayfirst
+    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+    # retry for any NaT: replace '-' with '/' then dayfirst again
+    mask = dt.isna() & s.notna()
+    if mask.any():
+        s2 = s.str.replace("-", "/", regex=False)
+        dt2 = pd.to_datetime(s2, errors="coerce", dayfirst=True)
+        dt.loc[mask] = dt2.loc[mask]
+
+    return dt.dt.normalize()
+
 # -------------------------------------------------
 # Load data (API -> CSV fallback)
 # -------------------------------------------------
 @st.cache_data(ttl=600)
 def load_transactions():
+    # Read
     api_key = st.secrets.get("gcp", {}).get("api_key")
     if api_key:
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/{RANGE}?key={api_key}"
@@ -59,9 +81,17 @@ def load_transactions():
             return pd.DataFrame()
         df = pd.DataFrame(vals[1:], columns=vals[0])
     else:
-        df = pd.read_csv(CSV_URL)
+        # keep Date as string on read; we'll parse ourselves
+        df = pd.read_csv(CSV_URL, dtype=str).fillna("")
 
-    # Normalize headers
+    # Clean headers (strip, fix NBSP)
+    df.columns = (
+        pd.Index(df.columns)
+        .str.replace("\u00A0", " ", regex=False)
+        .str.strip()
+    )
+
+    # Standardize expected headers
     rename_map = {
         "Supplier Name": "Supplier Name",
         "Code": "Code",
@@ -71,15 +101,21 @@ def load_transactions():
         "Bonus": "Bonus",
         "Bonus %": "Bonus %"
     }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    # Also tolerate 'quantity purchased' variants
+    for c in list(df.columns):
+        lc = c.lower().strip()
+        if lc in ["qty purchased", "quantity purchased"]:
+            rename_map[c] = "Qty Purchased"
+    df = df.rename(columns=rename_map)
 
-    # Types
+    # Parse Date (strict dd/mm/yyyy behavior)
     if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
+        df["Date"] = parse_dates_ddmmyyyy(df["Date"])
 
+    # Numeric columns
     for c in ["Qty Purchased", "Bonus"]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
 
     if "Bonus %" in df.columns:
         df["Bonus %"] = (
@@ -96,8 +132,8 @@ tx = load_transactions()
 st.title("📊 Purchase Dashboard")
 st.caption("ℹ️ Data available from **01/08/2024** onward.")
 
-if tx.empty:
-    st.warning("No data found. Check your sheet sharing, tab gid, or API key.")
+if tx.empty or "Date" not in tx.columns:
+    st.warning("No data found or 'Date' column missing. Check sharing, tab gid, or column names.")
     st.stop()
 
 # -------------------------------------------------
@@ -106,15 +142,15 @@ if tx.empty:
 with st.sidebar:
     st.header("Filters")
 
-    # Date range controls (not earlier than 01/08/2024)
+    # Date bounds (respect earliest available)
     data_min = tx["Date"].min()
     data_max = tx["Date"].max()
     min_allowed = max(EARLIEST_AVAILABLE, data_min) if pd.notna(data_min) else EARLIEST_AVAILABLE
-    max_allowed = data_max if pd.notna(data_max) else pd.Timestamp.today()
+    max_allowed = data_max if pd.notna(data_max) else pd.Timestamp.today().normalize()
 
     default_range = (min_allowed.date(), max_allowed.date())
     date_range = st.date_input(
-        "Date range",
+        "Date range (dd/mm/yyyy)",
         value=default_range,
         min_value=min_allowed.date(),
         max_value=max_allowed.date(),
@@ -127,10 +163,9 @@ with st.sidebar:
 
     q = st.text_input("Search (code or product)", "")
     bonus_filter = st.selectbox("Bonus filter", ["All", "With Bonus", "Without Bonus"])
-    min_qty = st.slider(
-        "Min Qty Purchased (product total)",
-        0, int(tx["Qty Purchased"].sum()), 0, step=100
-    )
+    # safeguard for slider upper bound
+    total_qty = pd.to_numeric(tx.get("Qty Purchased", pd.Series([], dtype=float)), errors="coerce").fillna(0).sum()
+    min_qty = st.slider("Min Qty Purchased (product total)", 0, int(max(total_qty, 0)), 0, step=100)
     top_n = st.slider("Top-N for charts", 5, 40, 15)
 
 st.caption(
@@ -138,14 +173,16 @@ st.caption(
     f"to **{end_date.strftime(DATE_FMT_DISPLAY)}**."
 )
 
-# Transaction-level mask (date + search)
-mask_tx = pd.Series(True, index=tx.index)
-mask_tx &= tx["Date"].between(start_date, end_date, inclusive="both")
+# Transaction-level mask (DATE + SEARCH)
+start_norm = start_date.normalize()
+end_norm   = end_date.normalize()
+mask_tx = (tx["Date"] >= start_norm) & (tx["Date"] <= end_norm)
+
 if q.strip():
     ql = q.strip().lower()
     mask_tx &= (
-        tx["Product"].str.lower().str.contains(ql, na=False)
-        | tx["Code"].astype(str).str.contains(ql, na=False)
+        tx.get("Product", pd.Series("", index=tx.index)).astype(str).str.lower().str.contains(ql, na=False)
+        | tx.get("Code", pd.Series("", index=tx.index)).astype(str).str.contains(ql, na=False)
     )
 
 tx_f = tx[mask_tx].copy()
@@ -157,13 +194,12 @@ if tx_f.empty:
 # -------------------------------------------------
 # Aggregate to PRODUCT level (with Times Purchased & Avg Days Between)
 # -------------------------------------------------
-# Base aggregates
 agg_base = (
     tx_f.groupby(["Code", "Product"], as_index=False)
         .agg(
             Qty_Purchased=("Qty Purchased", "sum"),
             Bonus_Received=("Bonus", "sum"),
-            Times_Purchased=("Date", "count"),     # number of transactions (rows)
+            Times_Purchased=("Date", "count"),
             Times_Bonus=("Bonus", lambda s: (s > 0).sum()),
             Avg_Purchase_Qty=("Qty Purchased", "mean"),
             Avg_Bonus_Qty=("Bonus", "mean"),
@@ -178,18 +214,14 @@ agg_base = (
         })
 )
 
-# Avg days between purchases per product
 gap_series = (
     tx_f.groupby(["Code", "Product"])["Date"]
         .apply(avg_gap_days)
         .reset_index(name="Avg Days Between")
 )
 
-# Merge & compute effective Bonus %
 agg = agg_base.merge(gap_series, on=["Code", "Product"], how="left")
-agg["Bonus %"] = (
-    agg["Bonus Received"] / agg["Qty Purchased"] * 100
-).replace([pd.NA, pd.NaT, float("inf")], 0).fillna(0)
+agg["Bonus %"] = (agg["Bonus Received"] / agg["Qty Purchased"] * 100).replace([pd.NA, pd.NaT, float("inf")], 0).fillna(0)
 agg["Avg Days Between"] = agg["Avg Days Between"].round(1)
 
 # Product-level filters
@@ -317,7 +349,7 @@ cols = [
 ]
 present = [c for c in cols if c in agg.columns]
 st.dataframe(
-    agg[present].sort_values("Qty Purchased", descending=False if False else True),
+    agg[present].sort_values("Qty Purchased", ascending=False),
     use_container_width=True, hide_index=True
 )
 
@@ -327,7 +359,7 @@ with st.expander("🔎 View raw transactions (filtered)"):
     show_cols = [c for c in show_cols if c in tx_f.columns]
     tx_show = tx_f[show_cols].copy()
     if "Date" in tx_show.columns:
-        tx_show["_sort_date"] = tx_show["Date"]  # for proper chronological sort
+        tx_show["_sort_date"] = tx_show["Date"]  # for correct sort
         tx_show["Date"] = tx_show["Date"].dt.strftime(DATE_FMT_DISPLAY)
         tx_show = tx_show.sort_values(["Product", "_sort_date"]).drop(columns=["_sort_date"])
     st.dataframe(tx_show, use_container_width=True, hide_index=True)
