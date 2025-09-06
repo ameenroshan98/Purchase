@@ -26,10 +26,7 @@ def short_label(code, name, n=40):
     return f"{code} — {name[:n]}…" if len(name) > n else f"{code} — {name}"
 
 def avg_gap_days(s: pd.Series) -> float:
-    """
-    Average days between purchases for a product (unique dates only).
-    Assumes s is already datetime64[ns].
-    """
+    """Average days between purchases for a product (unique dates only)."""
     dates = (
         pd.to_datetime(s, errors="coerce")
         .dropna()
@@ -51,17 +48,12 @@ def parse_dates_ddmmyyyy(col: pd.Series) -> pd.Series:
     - normalizes to midnight
     """
     s = col.astype(str).str.strip().str.replace("\u00A0", " ", regex=False)
-
-    # primary parse: dayfirst
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-
-    # retry for any NaT: replace '-' with '/' then dayfirst again
     mask = dt.isna() & s.notna()
     if mask.any():
         s2 = s.str.replace("-", "/", regex=False)
         dt2 = pd.to_datetime(s2, errors="coerce", dayfirst=True)
         dt.loc[mask] = dt2.loc[mask]
-
     return dt.dt.normalize()
 
 # -------------------------------------------------
@@ -69,7 +61,6 @@ def parse_dates_ddmmyyyy(col: pd.Series) -> pd.Series:
 # -------------------------------------------------
 @st.cache_data(ttl=600)
 def load_transactions():
-    # Read
     api_key = st.secrets.get("gcp", {}).get("api_key")
     if api_key:
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/{RANGE}?key={api_key}"
@@ -81,10 +72,9 @@ def load_transactions():
             return pd.DataFrame()
         df = pd.DataFrame(vals[1:], columns=vals[0])
     else:
-        # keep Date as string on read; we'll parse ourselves
         df = pd.read_csv(CSV_URL, dtype=str).fillna("")
 
-    # Clean headers (strip, fix NBSP)
+    # Clean headers
     df.columns = (
         pd.Index(df.columns)
         .str.replace("\u00A0", " ", regex=False)
@@ -101,7 +91,7 @@ def load_transactions():
         "Bonus": "Bonus",
         "Bonus %": "Bonus %"
     }
-    # Also tolerate 'quantity purchased' variants
+    # Tolerate variants
     for c in list(df.columns):
         lc = c.lower().strip()
         if lc in ["qty purchased", "quantity purchased"]:
@@ -137,7 +127,7 @@ if tx.empty or "Date" not in tx.columns:
     st.stop()
 
 # -------------------------------------------------
-# Sidebar Filters (includes DATE RANGE)
+# Sidebar Filters (DATE + SUPPLIER + search)
 # -------------------------------------------------
 with st.sidebar:
     st.header("Filters")
@@ -161,9 +151,16 @@ with st.sidebar:
         start_date = pd.Timestamp(date_range)
         end_date = start_date
 
+    # NEW: Supplier filter
+    sup_series = tx.get("Supplier Name", pd.Series("", index=tx.index)).astype(str).str.strip()
+    supplier_options = sorted([s for s in sup_series.unique() if s])
+    selected_suppliers = st.multiselect(
+        "Supplier(s)", options=supplier_options, default=supplier_options,
+        help="Filter transactions by supplier. Defaults to all."
+    )
+
     q = st.text_input("Search (code or product)", "")
     bonus_filter = st.selectbox("Bonus filter", ["All", "With Bonus", "Without Bonus"])
-    # safeguard for slider upper bound
     total_qty = pd.to_numeric(tx.get("Qty Purchased", pd.Series([], dtype=float)), errors="coerce").fillna(0).sum()
     min_qty = st.slider("Min Qty Purchased (product total)", 0, int(max(total_qty, 0)), 0, step=100)
     top_n = st.slider("Top-N for charts", 5, 40, 15)
@@ -173,10 +170,14 @@ st.caption(
     f"to **{end_date.strftime(DATE_FMT_DISPLAY)}**."
 )
 
-# Transaction-level mask (DATE + SEARCH)
+# Transaction-level mask (DATE + SUPPLIER + SEARCH)
 start_norm = start_date.normalize()
 end_norm   = end_date.normalize()
 mask_tx = (tx["Date"] >= start_norm) & (tx["Date"] <= end_norm)
+
+# Supplier filter (treat empty selection as 'all' to avoid accidental blank state)
+if selected_suppliers and len(selected_suppliers) < len(supplier_options):
+    mask_tx &= sup_series.isin(selected_suppliers)
 
 if q.strip():
     ql = q.strip().lower()
@@ -232,7 +233,7 @@ elif bonus_filter == "Without Bonus":
 agg = agg[agg["Qty Purchased"] >= min_qty]
 
 if agg.empty:
-    st.info("No products after applying filters. Try adjusting date range or Min Qty.")
+    st.info("No products after applying filters. Try adjusting supplier selection, date range, or Min Qty.")
     st.stop()
 
 # -------------------------------------------------
