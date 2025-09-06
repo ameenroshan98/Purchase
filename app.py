@@ -14,8 +14,9 @@ GID      = 0  # change if your data tab is not the first
 RANGE    = "Sheet1!A1:G100000"   # A..G = Supplier..Bonus %
 CSV_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
 
-# Earliest available data (requested banner + min date)
-EARLIEST_AVAILABLE = pd.Timestamp(2024, 8, 1)  # 01.08.2024
+# Earliest available data (banner + min date)
+EARLIEST_AVAILABLE = pd.Timestamp(2024, 8, 1)  # 01/08/2024
+DATE_FMT_DISPLAY = "%d/%m/%Y"                  # dd/mm/yyyy
 
 # -------------------------------------------------
 # Helpers
@@ -25,7 +26,11 @@ def short_label(code, name, n=40):
     return f"{code} — {name[:n]}…" if len(name) > n else f"{code} — {name}"
 
 def avg_gap_days(s: pd.Series) -> float:
-    """Average days between purchases using sorted UNIQUE dates."""
+    """
+    Average days between purchases for a product.
+    Uses sorted UNIQUE dates to avoid multiple transactions on the same day
+    creating zero gaps.
+    """
     dates = (
         pd.to_datetime(s, errors="coerce", dayfirst=True)
         .dropna()
@@ -89,19 +94,19 @@ def load_transactions():
 tx = load_transactions()
 
 st.title("📊 Purchase Dashboard")
-st.caption("ℹ️ Data available from **01.08.2024** onward.")
+st.caption("ℹ️ Data available from **01/08/2024** onward.")
 
 if tx.empty:
     st.warning("No data found. Check your sheet sharing, tab gid, or API key.")
     st.stop()
 
 # -------------------------------------------------
-# Sidebar Filters (now includes DATE RANGE)
+# Sidebar Filters (includes DATE RANGE)
 # -------------------------------------------------
 with st.sidebar:
     st.header("Filters")
 
-    # Date range setup from data but not earlier than EARLIEST_AVAILABLE
+    # Date range controls (not earlier than 01/08/2024)
     data_min = tx["Date"].min()
     data_max = tx["Date"].max()
     min_allowed = max(EARLIEST_AVAILABLE, data_min) if pd.notna(data_min) else EARLIEST_AVAILABLE
@@ -114,7 +119,6 @@ with st.sidebar:
         min_value=min_allowed.date(),
         max_value=max_allowed.date(),
     )
-    # Handle both single date and tuple
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_date, end_date = [pd.Timestamp(d) for d in date_range]
     else:
@@ -123,17 +127,26 @@ with st.sidebar:
 
     q = st.text_input("Search (code or product)", "")
     bonus_filter = st.selectbox("Bonus filter", ["All", "With Bonus", "Without Bonus"])
-    min_qty = st.slider("Min Qty Purchased (product total)", 0, int(tx["Qty Purchased"].sum()), 0, step=100)
+    min_qty = st.slider(
+        "Min Qty Purchased (product total)",
+        0, int(tx["Qty Purchased"].sum()), 0, step=100
+    )
     top_n = st.slider("Top-N for charts", 5, 40, 15)
 
-st.caption(f"Showing data from **{start_date:%d.%m.%Y}** to **{end_date:%d.%m.%Y}**.")
+st.caption(
+    f"Showing data from **{start_date.strftime(DATE_FMT_DISPLAY)}** "
+    f"to **{end_date.strftime(DATE_FMT_DISPLAY)}**."
+)
 
 # Transaction-level mask (date + search)
 mask_tx = pd.Series(True, index=tx.index)
 mask_tx &= tx["Date"].between(start_date, end_date, inclusive="both")
 if q.strip():
     ql = q.strip().lower()
-    mask_tx &= tx["Product"].str.lower().str.contains(ql, na=False) | tx["Code"].astype(str).str.contains(ql, na=False)
+    mask_tx &= (
+        tx["Product"].str.lower().str.contains(ql, na=False)
+        | tx["Code"].astype(str).str.contains(ql, na=False)
+    )
 
 tx_f = tx[mask_tx].copy()
 
@@ -144,12 +157,13 @@ if tx_f.empty:
 # -------------------------------------------------
 # Aggregate to PRODUCT level (with Times Purchased & Avg Days Between)
 # -------------------------------------------------
+# Base aggregates
 agg_base = (
     tx_f.groupby(["Code", "Product"], as_index=False)
         .agg(
             Qty_Purchased=("Qty Purchased", "sum"),
             Bonus_Received=("Bonus", "sum"),
-            Times_Purchased=("Date", "count"),
+            Times_Purchased=("Date", "count"),     # number of transactions (rows)
             Times_Bonus=("Bonus", lambda s: (s > 0).sum()),
             Avg_Purchase_Qty=("Qty Purchased", "mean"),
             Avg_Bonus_Qty=("Bonus", "mean"),
@@ -164,14 +178,18 @@ agg_base = (
         })
 )
 
+# Avg days between purchases per product
 gap_series = (
     tx_f.groupby(["Code", "Product"])["Date"]
         .apply(avg_gap_days)
         .reset_index(name="Avg Days Between")
 )
 
+# Merge & compute effective Bonus %
 agg = agg_base.merge(gap_series, on=["Code", "Product"], how="left")
-agg["Bonus %"] = (agg["Bonus Received"] / agg["Qty Purchased"] * 100).replace([pd.NA, pd.NaT, float("inf")], 0).fillna(0)
+agg["Bonus %"] = (
+    agg["Bonus Received"] / agg["Qty Purchased"] * 100
+).replace([pd.NA, pd.NaT, float("inf")], 0).fillna(0)
 agg["Avg Days Between"] = agg["Avg Days Between"].round(1)
 
 # Product-level filters
@@ -206,6 +224,7 @@ st.divider()
 top_by_qty = agg.sort_values("Qty Purchased", ascending=False).head(top_n).copy()
 top_by_qty["Label"] = top_by_qty.apply(lambda r: short_label(r["Code"], r["Product"], 42), axis=1)
 
+# Horizontal grouped bars (Qty vs Bonus)
 st.subheader("Purchased vs Bonus — Top Products")
 if not top_by_qty.empty:
     m = top_by_qty.melt(
@@ -227,6 +246,7 @@ if not top_by_qty.empty:
 else:
     st.info("No rows for bar chart.")
 
+# Treemap + Bubble
 colA, colB = st.columns(2)
 with colA:
     st.subheader("Purchase Share — Top Products (Treemap)")
@@ -271,14 +291,16 @@ left, right = st.columns(2)
 with left:
     st.markdown("**Top by Volume (Qty Purchased)**")
     t1 = agg.sort_values("Qty Purchased", ascending=False).head(10)[
-        ["Code", "Product", "Qty Purchased", "Bonus Received", "Times Purchased", "Avg Days Between", "Bonus %"]
+        ["Code", "Product", "Qty Purchased", "Bonus Received",
+         "Times Purchased", "Avg Days Between", "Bonus %"]
     ]
     st.dataframe(t1, use_container_width=True, hide_index=True)
 
 with right:
     st.markdown("**Top by Bonus % (min 100 units)**")
     t2 = agg[agg["Qty Purchased"] >= 100].sort_values("Bonus %", ascending=False).head(10)[
-        ["Code", "Product", "Qty Purchased", "Bonus Received", "Times Purchased", "Avg Days Between", "Bonus %"]
+        ["Code", "Product", "Qty Purchased", "Bonus Received",
+         "Times Purchased", "Avg Days Between", "Bonus %"]
     ]
     st.dataframe(t2, use_container_width=True, hide_index=True)
 
@@ -295,15 +317,20 @@ cols = [
 ]
 present = [c for c in cols if c in agg.columns]
 st.dataframe(
-    agg[present].sort_values("Qty Purchased", ascending=False),
+    agg[present].sort_values("Qty Purchased", descending=False if False else True),
     use_container_width=True, hide_index=True
 )
 
-# Raw transactions (filtered)
+# Raw transactions (filtered) with DD/MM/YYYY display
 with st.expander("🔎 View raw transactions (filtered)"):
     show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %"]
     show_cols = [c for c in show_cols if c in tx_f.columns]
-    st.dataframe(tx_f[show_cols].sort_values(["Product","Date"]), use_container_width=True, hide_index=True)
+    tx_show = tx_f[show_cols].copy()
+    if "Date" in tx_show.columns:
+        tx_show["_sort_date"] = tx_show["Date"]  # for proper chronological sort
+        tx_show["Date"] = tx_show["Date"].dt.strftime(DATE_FMT_DISPLAY)
+        tx_show = tx_show.sort_values(["Product", "_sort_date"]).drop(columns=["_sort_date"])
+    st.dataframe(tx_show, use_container_width=True, hide_index=True)
 
 # Download summary
 csv_agg = agg[present].to_csv(index=False).encode("utf-8")
