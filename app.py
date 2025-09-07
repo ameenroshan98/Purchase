@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.express as px
+from io import BytesIO
+import re
 
 # -------------------------------------------------
 # Page config
@@ -10,8 +12,10 @@ st.set_page_config(page_title="Purchase Dashboard", layout="wide")
 
 # ---- Google Sheet config
 SHEET_ID = "1R7o4xKMeYWcYWwAOorMyYDtjg0-74FqDK0xAFKN6Iuo"
-GID      = 0  # change if your data tab is not the first
-RANGE    = "Sheet1!A:G"  # pull ALL used rows in columns A..G (no hard row cap)
+GID      = 0  # used only by CSV fallback
+# Full workbook (all tabs) export:
+XLSX_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
+# Single-tab CSV fallback:
 CSV_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
 
 # Earliest available data + display format  (MM/DD/YYYY)
@@ -39,69 +43,110 @@ def avg_gap_days(s: pd.Series) -> float:
     diffs = dates.diff().dt.days.dropna()
     return float(diffs.mean())
 
-def parse_dates_force_mdy(raw_col: pd.Series):
+def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
     """
-    Enforce MM/DD/YYYY semantics and handle:
-      - '8/11/2024', '08-11-2024', '08.11.2024', '8/11/24'
-      - ISO '2024-11-08'
-      - Google/Excel serial numbers (e.g., 45678)
+    Smart parser with per-row detection + serials + ISO.
+    prefer: "mdy" (default) or "dmy" used only when ambiguous (both parts <= 12).
     Returns (parsed_Timestamps, original_strings)
     """
     s_raw = raw_col.astype(str)
 
-    # Clean NBSP, trim, normalize separators
-    s = (
-        s_raw.str.replace("\u00A0", " ", regex=False)
-             .str.strip()
-             .str.replace(".", "/", regex=False)  # 08.11.2024 -> 08/11/2024
-    )
+    # Clean NBSP, trim, unify separators
+    s = (s_raw
+         .str.replace("\u00A0", " ", regex=False)
+         .str.strip()
+         .str.replace(".", "/", regex=False))
 
-    # Try month-first directly
-    dt1 = pd.to_datetime(s, errors="coerce", dayfirst=False)
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
 
-    # Retry after '-' -> '/'
-    mask = dt1.isna()
-    if mask.any():
-        s2 = s.str.replace("-", "/", regex=False)
-        dt2 = pd.to_datetime(s2, errors="coerce", dayfirst=False)
-        dt1.loc[mask] = dt2.loc[mask]
-
-    # Excel/Sheets serial numbers (vectorized)
+    # 1) Excel/Sheets serial numbers
     serial = pd.to_numeric(s, errors="coerce")
-    serial_mask = serial.notna() & (dt1.isna())
+    serial_mask = serial.notna()
     if serial_mask.any():
-        dt_serial = pd.to_datetime(serial, unit="D", origin="1899-12-30", errors="coerce")
-        dt1.loc[serial_mask] = dt_serial.loc[serial_mask]
+        out.loc[serial_mask] = pd.to_datetime(
+            serial.loc[serial_mask], unit="D", origin="1899-12-30", errors="coerce"
+        )
 
-    return dt1.dt.normalize(), s_raw
+    # 2) Strings with separators
+    mask = ~serial_mask
+    s2 = s[mask].str.replace("-", "/", regex=False)
+
+    def parse_one(val: str):
+        if not val:
+            return pd.NaT
+        # Try ISO first (YYYY-MM-DD or already real date-like)
+        iso_try = pd.to_datetime(val, errors="coerce")
+        if pd.notna(iso_try):
+            return iso_try.normalize()
+
+        parts = re.split(r"[\/]", val)
+        if len(parts) != 3:
+            return pd.NaT
+        try:
+            a, b, c = [int(p) for p in parts]
+        except Exception:
+            return pd.NaT
+
+        # Fix 2-digit year
+        if c < 100:
+            c += 2000 if c < 70 else 1900
+
+        # Decide month/day using obvious rules; fall back to preference
+        if a > 12 and b <= 12:   # clearly D/M/Y
+            m, d, y = b, a, c
+        elif b > 12 and a <= 12: # clearly M/D/Y
+            m, d, y = a, b, c
+        elif a > 12 and b > 12:  # impossible
+            return pd.NaT
+        else:
+            if prefer.lower() == "dmy":
+                m, d, y = b, a, c
+            else:
+                m, d, y = a, b, c
+
+        try:
+            return pd.Timestamp(year=y, month=m, day=d).normalize()
+        except Exception:
+            return pd.NaT
+
+    parsed = s2.apply(parse_one)
+    out.loc[mask] = parsed.values
+    return out, s_raw
 
 # -------------------------------------------------
-# Load data (API -> CSV fallback)
+# Load ALL data from the Google Sheet (all tabs), fallback to CSV
 # -------------------------------------------------
-@st.cache_data(ttl=600)
-def load_transactions():
-    api_key = st.secrets.get("gcp", {}).get("api_key")
-    if api_key:
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/{RANGE}?key={api_key}"
-        r = requests.get(url, timeout=30)
+@st.cache_data(ttl=900)
+def load_transactions(prefer="mdy"):
+    # 1) Try XLSX export (entire workbook, every tab)
+    try:
+        r = requests.get(XLSX_URL, timeout=60)
         r.raise_for_status()
-        js = r.json()
-        vals = js.get("values", [])
-        if not vals:
-            return pd.DataFrame()
-        df = pd.DataFrame(vals[1:], columns=vals[0])
-    else:
-        # Fallback: entire tab via CSV
-        df = pd.read_csv(CSV_URL, dtype=str).fillna("")
+        with BytesIO(r.content) as bio:
+            book = pd.read_excel(bio, sheet_name=None, dtype=str)  # dict of sheet_name -> DataFrame
 
-    # Clean headers
-    df.columns = (
-        pd.Index(df.columns)
-        .str.replace("\u00A0", " ", regex=False)
-        .str.strip()
-    )
+        frames = []
+        for sheet_name, df in book.items():
+            if df is None or df.empty:
+                continue
+            # Drop completely empty rows; standardize headers
+            df = df.dropna(how="all")
+            df.columns = pd.Index(df.columns).astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+            df["__sheet__"] = sheet_name
+            frames.append(df)
 
-    # Standardize expected headers
+        df_all = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    except Exception:
+        # 2) Fallback to CSV of one tab (gid)
+        df_all = pd.read_csv(CSV_URL, dtype=str).fillna("")
+        df_all.columns = pd.Index(df_all.columns).astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+        df_all["__sheet__"] = "gid_{}".format(GID)
+
+    if df_all.empty:
+        return df_all
+
+    # Standardize expected headers (tolerate variants)
     rename_map = {
         "Supplier Name": "Supplier Name",
         "Code": "Code",
@@ -111,41 +156,48 @@ def load_transactions():
         "Bonus": "Bonus",
         "Bonus %": "Bonus %"
     }
-    # Tolerate header variants
-    for c in list(df.columns):
+    for c in list(df_all.columns):
         lc = c.lower().strip()
-        if lc in ["qty purchased", "quantity purchased"]:
+        if lc in ["qty purchased", "quantity purchased", "qty"]:
             rename_map[c] = "Qty Purchased"
-    df = df.rename(columns=rename_map)
+    df_all = df_all.rename(columns=rename_map)
 
-    # Parse Date (force MM/DD/YYYY semantics)
-    if "Date" in df.columns:
-        parsed, date_raw = parse_dates_force_mdy(df["Date"])
-        df["_Date_raw"] = date_raw
-        df["Date"] = parsed
+    # Parse Date (smart; prefers MDY)
+    if "Date" in df_all.columns:
+        parsed, date_raw = parse_dates_smart(df_all["Date"], prefer=prefer)
+        df_all["_Date_raw"] = date_raw
+        df_all["Date"] = parsed
 
-    # Numeric columns
+    # Numerics
     for c in ["Qty Purchased", "Bonus"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
+        if c in df_all.columns:
+            df_all[c] = pd.to_numeric(df_all[c].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
 
-    if "Bonus %" in df.columns:
-        df["Bonus %"] = (
-            df["Bonus %"].astype(str)
+    if "Bonus %" in df_all.columns:
+        df_all["Bonus %"] = (
+            df_all["Bonus %"].astype(str)
             .str.replace("%", "", regex=False)
             .str.replace(",", "", regex=False)
         )
-        df["Bonus %"] = pd.to_numeric(df["Bonus %"], errors="coerce").fillna(0.0)
+        df_all["Bonus %"] = pd.to_numeric(df_all["Bonus %"], errors="coerce").fillna(0.0)
 
-    return df
+    return df_all
 
-tx = load_transactions()
+# -------------------------------------------------
+# UI & Analytics
+# -------------------------------------------------
+# Optional: let user choose how to interpret ambiguous dates (rare but safe)
+with st.sidebar:
+    date_pref = st.radio("Interpret ambiguous dates as", ["MM/DD/YYYY","DD/MM/YYYY"], horizontal=True, index=0)
+prefer = "mdy" if date_pref.startswith("MM") else "dmy"
+
+tx = load_transactions(prefer=prefer)
 
 st.title("📊 Purchase Dashboard")
 st.caption("ℹ️ Data available from **08/01/2024** onward.")
 
 if tx.empty or "Date" not in tx.columns:
-    st.warning("No data found or 'Date' column missing. Check sharing, tab gid, or column names.")
+    st.warning("No data found or 'Date' column missing. Check sharing, or sheet structure.")
     st.stop()
 
 # ---- Diagnostics (how much got loaded + date parsing)
@@ -157,6 +209,7 @@ with st.expander("📊 Load diagnostics"):
         "Earliest parsed date": str(tx["Date"].min()),
         "Latest parsed date": str(tx["Date"].max()),
         "Distinct suppliers": int(tx["Supplier Name"].nunique() if "Supplier Name" in tx else 0),
+        "Sheets combined": int(tx["__sheet__"].nunique() if "__sheet__" in tx else 1),
     })
 parse_fail = tx["Date"].isna().sum()
 if parse_fail > 0:
@@ -189,7 +242,7 @@ with st.sidebar:
         start_date = pd.Timestamp(date_range)
         end_date = start_date
 
-    # Supplier DROPDOWN (single select, as requested)
+    # Supplier DROPDOWN (single select)
     sup_series = tx.get("Supplier Name", pd.Series("", index=tx.index)).astype(str).str.strip()
     supplier_options = sorted([s for s in sup_series.unique() if s])
     supplier_dropdown_options = ["All suppliers"] + supplier_options
@@ -202,8 +255,28 @@ with st.sidebar:
 
     q = st.text_input("Search (code or product)", "")
     bonus_filter = st.selectbox("Bonus filter", ["All", "With Bonus", "Without Bonus"])
-    total_qty = pd.to_numeric(tx.get("Qty Purchased", pd.Series([], dtype=float)), errors="coerce").fillna(0).sum()
-    min_qty = st.slider("Min Qty Purchased (product total)", 0, int(max(total_qty, 0)), 0, step=100)
+
+    # Dynamic slider max (based on current date/supplier/search preview)
+    start_norm_preview = pd.Timestamp(default_range[0]).normalize()
+    end_norm_preview   = pd.Timestamp(default_range[1]).normalize()
+    mask_preview = tx["Date"].notna() & (tx["Date"] >= start_norm_preview) & (tx["Date"] <= end_norm_preview)
+    if supplier_options and selected_supplier != "All suppliers":
+        mask_preview &= (sup_series == selected_supplier)
+    if q.strip():
+        ql = q.strip().lower()
+        mask_preview &= (
+            tx.get("Product", pd.Series("", index=tx.index)).astype(str).str.lower().str.contains(ql, na=False)
+            | tx.get("Code", pd.Series("", index=tx.index)).astype(str).str.contains(ql, na=False)
+        )
+    preview_max = 0
+    if mask_preview.any():
+        prev_agg = (tx.loc[mask_preview]
+                      .groupby(["Code","Product"], as_index=False)["Qty Purchased"]
+                      .sum())
+        if not prev_agg.empty:
+            preview_max = int(prev_agg["Qty Purchased"].max())
+
+    min_qty = st.slider("Min Qty Purchased (product total)", 0, max(preview_max, 0), 0, step=100)
 
     scope = st.radio("Chart scope", ["Top-N", "All"], horizontal=True)
     if scope == "Top-N":
@@ -344,8 +417,15 @@ st.divider()
 # Charts
 # -------------------------------------------------
 chart_df = agg.sort_values("Qty Purchased", ascending=False)
-if top_n is not None:
-    chart_df = chart_df.head(top_n)
+top_n = st.session_state.get("top_n", None) if 'top_n' in st.session_state else None  # safeguard
+# (We'll set top_n via sidebar above; this line just avoids NameError if user reruns quickly)
+# If scope == "Top-N", top_n is already defined; otherwise it stays None.
+try:
+    if top_n is not None:
+        chart_df = chart_df.head(top_n)
+except NameError:
+    pass
+
 chart_df["Label"] = chart_df.apply(lambda r: short_label(r["Code"], r["Product"]), axis=1)
 
 # Coverage vs totals (helps reconcile with KPIs)
@@ -576,13 +656,16 @@ if selected_sku != "(Choose a product)":
 # Raw transactions (filtered) with MM/DD/YYYY display
 # -------------------------------------------------
 with st.expander("🧾 View all filtered transactions"):
-    show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %"]
-    show_cols = [c for c in show_cols if c in tx_f.columns]
-    tx_show = tx_f[show_cols].copy()
+    show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %","__sheet__"]
+    show_cols = [c for c in show_cols if c in tx_f.columns or c == "__sheet__"]
+    tx_show = tx_f.copy()
+    if "__sheet__" not in tx_show.columns:
+        tx_show["__sheet__"] = "sheet"
+    tx_show = tx_show[show_cols]
     if "Date" in tx_show.columns:
         tx_show["_sort_date"] = tx_show["Date"]  # for correct sort
         tx_show["Date"] = tx_show["Date"].dt.strftime(DATE_FMT_DISPLAY)
-        tx_show = tx_show.sort_values(["Product", "_sort_date"]).drop(columns=["_sort_date"])
+        tx_show = tx_show.sort_values(["__sheet__", "Product", "_sort_date"]).drop(columns=["_sort_date"])
     st.dataframe(
         tx_show,
         use_container_width=True, hide_index=True,
