@@ -10,17 +10,13 @@ import re
 # -------------------------------------------------
 st.set_page_config(page_title="Purchase Dashboard", layout="wide")
 
-# ---- Google Sheet config
+# ---- Google Sheet config (entire workbook)
 SHEET_ID = "1R7o4xKMeYWcYWwAOorMyYDtjg0-74FqDK0xAFKN6Iuo"
 GID      = 0  # used only by CSV fallback
-# Full workbook (all tabs) export:
 XLSX_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
-# Single-tab CSV fallback:
 CSV_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
 
-# Earliest available data + display format  (MM/DD/YYYY)
-EARLIEST_AVAILABLE = pd.Timestamp(2024, 8, 1)   # 08/01/2024
-DATE_FMT_DISPLAY   = "%m/%d/%Y"                 # mm/dd/yyyy
+DATE_FMT_DISPLAY = "%m/%d/%Y"  # mm/dd/yyyy
 
 # -------------------------------------------------
 # Helpers
@@ -74,7 +70,7 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
     def parse_one(val: str):
         if not val:
             return pd.NaT
-        # Try ISO first (YYYY-MM-DD or already real date-like)
+        # Try ISO first
         iso_try = pd.to_datetime(val, errors="coerce")
         if pd.notna(iso_try):
             return iso_try.normalize()
@@ -87,16 +83,14 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
         except Exception:
             return pd.NaT
 
-        # Fix 2-digit year
         if c < 100:
             c += 2000 if c < 70 else 1900
 
-        # Decide month/day using obvious rules; fall back to preference
-        if a > 12 and b <= 12:   # clearly D/M/Y
+        if a > 12 and b <= 12:   # D/M/Y
             m, d, y = b, a, c
-        elif b > 12 and a <= 12: # clearly M/D/Y
+        elif b > 12 and a <= 12: # M/D/Y
             m, d, y = a, b, c
-        elif a > 12 and b > 12:  # impossible
+        elif a > 12 and b > 12:
             return pd.NaT
         else:
             if prefer.lower() == "dmy":
@@ -118,35 +112,31 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
 # -------------------------------------------------
 @st.cache_data(ttl=900)
 def load_transactions(prefer="mdy"):
-    # 1) Try XLSX export (entire workbook, every tab)
+    # Try XLSX (entire workbook)
     try:
         r = requests.get(XLSX_URL, timeout=60)
         r.raise_for_status()
         with BytesIO(r.content) as bio:
-            book = pd.read_excel(bio, sheet_name=None, dtype=str)  # dict of sheet_name -> DataFrame
-
+            book = pd.read_excel(bio, sheet_name=None, dtype=str)
         frames = []
         for sheet_name, df in book.items():
             if df is None or df.empty:
                 continue
-            # Drop completely empty rows; standardize headers
             df = df.dropna(how="all")
             df.columns = pd.Index(df.columns).astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
             df["__sheet__"] = sheet_name
             frames.append(df)
-
         df_all = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
     except Exception:
-        # 2) Fallback to CSV of one tab (gid)
+        # Fallback: CSV of one tab
         df_all = pd.read_csv(CSV_URL, dtype=str).fillna("")
         df_all.columns = pd.Index(df_all.columns).astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
-        df_all["__sheet__"] = "gid_{}".format(GID)
+        df_all["__sheet__"] = f"gid_{GID}"
 
     if df_all.empty:
         return df_all
 
-    # Standardize expected headers (tolerate variants)
+    # Standardize headers (tolerate variants)
     rename_map = {
         "Supplier Name": "Supplier Name",
         "Code": "Code",
@@ -184,83 +174,56 @@ def load_transactions(prefer="mdy"):
     return df_all
 
 # -------------------------------------------------
-# UI & Analytics
+# UI & Analytics (NO DATE FILTER)
 # -------------------------------------------------
-# Optional: let user choose how to interpret ambiguous dates (rare but safe)
-with st.sidebar:
-    date_pref = st.radio("Interpret ambiguous dates as", ["MM/DD/YYYY","DD/MM/YYYY"], horizontal=True, index=0)
-prefer = "mdy" if date_pref.startswith("MM") else "dmy"
-
-tx = load_transactions(prefer=prefer)
+tx = load_transactions(prefer="mdy")
 
 st.title("📊 Purchase Dashboard")
-st.caption("ℹ️ Data available from **08/01/2024** onward.")
 
-if tx.empty or "Date" not in tx.columns:
-    st.warning("No data found or 'Date' column missing. Check sharing, or sheet structure.")
+if tx.empty or "Code" not in tx.columns or "Product" not in tx.columns:
+    st.warning("No data found or required columns missing (Code/Product).")
     st.stop()
 
-# ---- Diagnostics (how much got loaded + date parsing)
+# Diagnostics
+min_date = tx["Date"].min(skipna=True) if "Date" in tx.columns else None
+max_date = tx["Date"].max(skipna=True) if "Date" in tx.columns else None
+cap = []
+if pd.notna(min_date): cap.append(f"from **{min_date.strftime(DATE_FMT_DISPLAY)}**")
+if pd.notna(max_date): cap.append(f"to **{max_date.strftime(DATE_FMT_DISPLAY)}**")
+if cap:
+    st.caption("ℹ️ Data range " + " ".join(cap))
+
 with st.expander("📊 Load diagnostics"):
     st.write({
         "Raw rows loaded": len(tx),
-        "Rows with parseable Date": int(tx["Date"].notna().sum()),
-        "Rows with missing/unparseable Date": int(tx["Date"].isna().sum()),
-        "Earliest parsed date": str(tx["Date"].min()),
-        "Latest parsed date": str(tx["Date"].max()),
+        "Rows with parseable Date": int(tx["Date"].notna().sum()) if "Date" in tx else "n/a",
+        "Rows with missing/unparseable Date": int(tx["Date"].isna().sum()) if "Date" in tx else "n/a",
         "Distinct suppliers": int(tx["Supplier Name"].nunique() if "Supplier Name" in tx else 0),
         "Sheets combined": int(tx["__sheet__"].nunique() if "__sheet__" in tx else 1),
     })
-parse_fail = tx["Date"].isna().sum()
-if parse_fail > 0:
+if "Date" in tx.columns and tx["Date"].isna().sum() > 0:
     bad = tx.loc[tx["Date"].isna(), "_Date_raw"].value_counts().head(10)
-    with st.expander(f"⚠️ {parse_fail} rows have unparseable dates — examples"):
+    with st.expander("⚠️ Examples of unparseable dates"):
         st.write(bad)
 
-# -------------------------------------------------
-# Sidebar Filters (DATE + SUPPLIER dropdown + search + scope)
-# -------------------------------------------------
+# Sidebar filters (NO date UI)
 with st.sidebar:
     st.header("Filters")
-
-    # Date bounds (respect earliest available)
-    data_min = tx["Date"].min(skipna=True)
-    data_max = tx["Date"].max(skipna=True)
-    min_allowed = max(EARLIEST_AVAILABLE, data_min) if pd.notna(data_min) else EARLIEST_AVAILABLE
-    max_allowed = data_max if pd.notna(data_max) else pd.Timestamp.today().normalize()
-
-    default_range = (min_allowed.date(), max_allowed.date())
-    date_range = st.date_input(
-        "Date range (mm/dd/yyyy)",
-        value=default_range,
-        min_value=min_allowed.date(),
-        max_value=max_allowed.date(),
-    )
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start_date, end_date = [pd.Timestamp(d) for d in date_range]
-    else:
-        start_date = pd.Timestamp(date_range)
-        end_date = start_date
-
-    # Supplier DROPDOWN (single select)
     sup_series = tx.get("Supplier Name", pd.Series("", index=tx.index)).astype(str).str.strip()
     supplier_options = sorted([s for s in sup_series.unique() if s])
-    supplier_dropdown_options = ["All suppliers"] + supplier_options
     selected_supplier = st.selectbox(
         "Supplier",
-        options=supplier_dropdown_options,
-        index=0,
-        help="Choose a single supplier or 'All suppliers'."
+        options=["All suppliers"] + supplier_options,
+        index=0
     )
 
     q = st.text_input("Search (code or product)", "")
+
     bonus_filter = st.selectbox("Bonus filter", ["All", "With Bonus", "Without Bonus"])
 
-    # Dynamic slider max (based on current date/supplier/search preview)
-    start_norm_preview = pd.Timestamp(default_range[0]).normalize()
-    end_norm_preview   = pd.Timestamp(default_range[1]).normalize()
-    mask_preview = tx["Date"].notna() & (tx["Date"] >= start_norm_preview) & (tx["Date"] <= end_norm_preview)
-    if supplier_options and selected_supplier != "All suppliers":
+    # Min-qty slider max based on supplier/search slice
+    mask_preview = pd.Series(True, index=tx.index)
+    if selected_supplier != "All suppliers":
         mask_preview &= (sup_series == selected_supplier)
     if q.strip():
         ql = q.strip().lower()
@@ -269,13 +232,12 @@ with st.sidebar:
             | tx.get("Code", pd.Series("", index=tx.index)).astype(str).str.contains(ql, na=False)
         )
     preview_max = 0
-    if mask_preview.any():
+    if mask_preview.any() and "Qty Purchased" in tx.columns:
         prev_agg = (tx.loc[mask_preview]
                       .groupby(["Code","Product"], as_index=False)["Qty Purchased"]
                       .sum())
         if not prev_agg.empty:
             preview_max = int(prev_agg["Qty Purchased"].max())
-
     min_qty = st.slider("Min Qty Purchased (product total)", 0, max(preview_max, 0), 0, step=100)
 
     scope = st.radio("Chart scope", ["Top-N", "All"], horizontal=True)
@@ -284,44 +246,32 @@ with st.sidebar:
     else:
         top_n = None
 
-st.caption(
-    f"Showing data from **{start_date.strftime(DATE_FMT_DISPLAY)}** "
-    f"to **{end_date.strftime(DATE_FMT_DISPLAY)}**."
-)
-
-# Transaction-level mask (DATE + SUPPLIER + SEARCH)
-start_norm = start_date.normalize()
-end_norm   = end_date.normalize()
-mask_tx = tx["Date"].notna() & (tx["Date"] >= start_norm) & (tx["Date"] <= end_norm)
-
+# Build transaction-level mask (supplier + search only)
+mask_tx = pd.Series(True, index=tx.index)
 if selected_supplier != "All suppliers":
     mask_tx &= (sup_series == selected_supplier)
-
 if q.strip():
     ql = q.strip().lower()
     mask_tx &= (
         tx.get("Product", pd.Series("", index=tx.index)).astype(str).str.lower().str.contains(ql, na=False)
         | tx.get("Code", pd.Series("", index=tx.index)).astype(str).str.contains(ql, na=False)
     )
-
 tx_f = tx[mask_tx].copy()
 if tx_f.empty:
-    st.info("No transactions match your filters/date range.")
+    st.info("No transactions match your supplier/search filters.")
     st.stop()
 
-# -------------------------------------------------
-# Aggregate to PRODUCT level (with Times Purchased & Avg Days Between)
-# -------------------------------------------------
+# Aggregate to PRODUCT level (whole dataset)
 agg_base = (
     tx_f.groupby(["Code", "Product"], as_index=False)
         .agg(
             Qty_Purchased=("Qty Purchased", "sum"),
             Bonus_Received=("Bonus", "sum"),
-            Times_Purchased=("Date", "count"),
+            Times_Purchased=("Product", "count"),   # count rows regardless of date
             Times_Bonus=("Bonus", lambda s: (s > 0).sum()),
             Avg_Purchase_Qty=("Qty Purchased", "mean"),
             Avg_Bonus_Qty=("Bonus", "mean"),
-            Last_Purchase=("Date", "max"),
+            Last_Purchase=("Date", "max") if "Date" in tx_f.columns else ("Product","count")
         )
         .rename(columns={
             "Qty_Purchased": "Qty Purchased",
@@ -334,11 +284,15 @@ agg_base = (
         })
 )
 
-gap_series = (
-    tx_f.groupby(["Code", "Product"])["Date"]
-        .apply(avg_gap_days)
-        .reset_index(name="Avg Days Between")
-)
+# Avg Days Between (uses only valid dates)
+if "Date" in tx_f.columns:
+    gap_series = (
+        tx_f.groupby(["Code", "Product"])["Date"]
+            .apply(avg_gap_days)
+            .reset_index(name="Avg Days Between")
+    )
+else:
+    gap_series = pd.DataFrame({"Code": [], "Product": [], "Avg Days Between": []})
 
 # Per-transaction bonus % variability (std dev)
 tx_tmp = tx_f.copy()
@@ -360,16 +314,33 @@ var_df = (
 agg = agg_base.merge(gap_series, on=["Code","Product"], how="left").merge(var_df, on=["Code","Product"], how="left")
 agg["Bonus %"] = (agg["Bonus Received"] / agg["Qty Purchased"] * 100).replace([pd.NA, pd.NaT, float("inf")], 0).fillna(0).round(1)
 agg["Avg Days Between"] = agg["Avg Days Between"].round(1)
-agg["Bonus Presence Rate"] = (agg["Times Bonus"] / agg["Times Purchased"]).fillna(0)
-agg["Recency Days"] = (end_norm - agg["Last Purchase Date"]).dt.days
 
-# -------------------------------------------------
-# 3-status human classification (Core / Promo-timed / Review)
-# -------------------------------------------------
-BONUS_PROMO = 8.0      # %: considered promo-driven if >= this
-BPR_PROMO = 0.50       # share of orders with bonus
-STALE_DAYS_MIN = 90    # days
-FACTOR_GAP = 1.5       # recency > 1.5x typical gap -> stale
+# Recency vs latest date found
+if "Date" in tx.columns and pd.notna(tx["Date"]).any():
+    end_norm = tx["Date"].dropna().max().normalize()
+    agg["Recency Days"] = (end_norm - agg["Last Purchase Date"]).dt.days
+else:
+    agg["Recency Days"] = pd.NA
+
+# Bonus presence rate
+agg["Bonus Presence Rate"] = (agg["Times Bonus"] / agg["Times Purchased"]).fillna(0)
+
+# Apply Min Qty + Bonus filters at product level
+agg = agg[agg["Qty Purchased"] >= min_qty]
+if bonus_filter == "With Bonus":
+    agg = agg[agg["Bonus %"] > 0]
+elif bonus_filter == "Without Bonus":
+    agg = agg[agg["Bonus %"] == 0]
+
+if agg.empty:
+    st.info("No products after Min Qty / Bonus filter. Adjust filters.")
+    st.stop()
+
+# 3-status classification (Core / Promo-timed / Review)
+BONUS_PROMO = 8.0      # %
+BPR_PROMO   = 0.50     # share of orders with bonus
+STALE_DAYS_MIN = 90
+FACTOR_GAP     = 1.5
 
 def classify_simple(r):
     ebp = r["Bonus %"]
@@ -392,15 +363,13 @@ STATUS_COPY = {
 }
 agg[["Status", "Status Note"]] = agg["StatusKey"].apply(lambda k: pd.Series(STATUS_COPY[k]))
 
-# ---- Status filter BEFORE KPIs (to keep numbers consistent)
+# Status filter (kept; not date-related)
 with st.sidebar:
     status_choice = st.selectbox("Status", ["(All)", "🟢 Core", "🟠 Promo-timed", "🔴 Review"], index=0)
 if status_choice != "(All)":
     agg = agg[agg["Status"] == status_choice]
 
-# -------------------------------------------------
-# KPIs (after ALL filters)
-# -------------------------------------------------
+# KPIs
 total_purchased = int(agg["Qty Purchased"].sum())
 total_bonus = int(agg["Bonus Received"].sum())
 overall_bonus_rate = (total_bonus / total_purchased * 100) if total_purchased > 0 else 0
@@ -413,22 +382,12 @@ c4.metric("Overall Bonus %", f"{overall_bonus_rate:.1f}%")
 
 st.divider()
 
-# -------------------------------------------------
 # Charts
-# -------------------------------------------------
 chart_df = agg.sort_values("Qty Purchased", ascending=False)
-top_n = st.session_state.get("top_n", None) if 'top_n' in st.session_state else None  # safeguard
-# (We'll set top_n via sidebar above; this line just avoids NameError if user reruns quickly)
-# If scope == "Top-N", top_n is already defined; otherwise it stays None.
-try:
-    if top_n is not None:
-        chart_df = chart_df.head(top_n)
-except NameError:
-    pass
-
+if 'top_n' in locals() and top_n is not None:
+    chart_df = chart_df.head(top_n)
 chart_df["Label"] = chart_df.apply(lambda r: short_label(r["Code"], r["Product"]), axis=1)
 
-# Coverage vs totals (helps reconcile with KPIs)
 top_qty   = chart_df["Qty Purchased"].sum()
 top_bonus = chart_df["Bonus Received"].sum()
 cov_qty   = (top_qty / total_purchased * 100) if total_purchased else 0
@@ -436,7 +395,6 @@ cov_bonus = (top_bonus / total_bonus * 100) if total_bonus else 0
 st.caption(f"Bars cover {top_qty:,.0f} purchased ({cov_qty:.1f}% of total) "
            f"and {top_bonus:,.0f} bonus ({cov_bonus:.1f}% of total).")
 
-# ---------- Purchased vs Bonus — Top Products (labels on Bonus only)
 st.subheader("Purchased vs Bonus — Top Products")
 if not chart_df.empty:
     m = chart_df.melt(
@@ -455,7 +413,6 @@ if not chart_df.empty:
     )
     fig_bar.update_traces(hovertemplate="%{y}<br>%{legendgroup}: %{x:,.0f}",
                           cliponaxis=False)
-    # Labels only for Bonus bars
     for tr in fig_bar.data:
         if tr.name == "Bonus Received":
             tr.text = [f"{v:,.0f}" for v in tr.x]
@@ -468,14 +425,13 @@ if not chart_df.empty:
 else:
     st.info("No rows for bar chart.")
 
-# Treemap + Bubble
 colA, colB = st.columns(2)
 with colA:
     st.subheader("Purchase Share — Top Products (Treemap)")
     if not chart_df.empty:
         fig_tree = px.treemap(
             chart_df,
-            path=[px.Constant("Top-N" if top_n else "All"), "Label"],
+            path=[px.Constant("Top-N" if ('top_n' in locals() and top_n is not None) else "All"), "Label"],
             values="Qty Purchased",
             hover_data={"Qty Purchased":":,", "Bonus Received":":,"}
         )
@@ -504,9 +460,7 @@ with colB:
 
 st.divider()
 
-# -------------------------------------------------
-# Highlights (with conditional formatting via column_config)
-# -------------------------------------------------
+# Highlights
 st.subheader("Highlights")
 left, right = st.columns(2)
 
@@ -523,11 +477,7 @@ with left:
             "Qty Purchased": st.column_config.NumberColumn(format="%,d"),
             "Bonus Received": st.column_config.NumberColumn(format="%,d"),
             "Avg Days Between": st.column_config.NumberColumn(format="%.1f"),
-            "Bonus %": st.column_config.ProgressColumn(
-                "Bonus %",
-                format="%.1f%%",
-                min_value=0, max_value=100,
-            ),
+            "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
         },
     )
 
@@ -544,19 +494,13 @@ with right:
             "Qty Purchased": st.column_config.NumberColumn(format="%,d"),
             "Bonus Received": st.column_config.NumberColumn(format="%,d"),
             "Avg Days Between": st.column_config.NumberColumn(format="%.1f"),
-            "Bonus %": st.column_config.ProgressColumn(
-                "Bonus %",
-                format="%.1f%%",
-                min_value=0, max_value=100,
-            ),
+            "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
         },
     )
 
 st.divider()
 
-# -------------------------------------------------
-# Detailed Products table (with 1-decimal Bonus % + formatting)
-# -------------------------------------------------
+# Detailed Products table
 st.subheader(f"Detailed Products ({len(agg):,})")
 cols = [
     "Status","Code","Product","Qty Purchased","Bonus Received",
@@ -577,19 +521,13 @@ st.dataframe(
         "Avg Days Between": st.column_config.NumberColumn(format="%.1f"),
         "Bonus Presence Rate": st.column_config.NumberColumn(format="%.2f"),
         "Bonus Variability (pp)": st.column_config.NumberColumn(format="%.1f"),
-        "Bonus %": st.column_config.ProgressColumn(
-            "Bonus %",
-            format="%.1f%%",
-            min_value=0, max_value=100,
-        ),
+        "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
     },
 )
 
 st.divider()
 
-# -------------------------------------------------
-# 🔎 SKU Drill-down: pick a product and see purchase history
-# -------------------------------------------------
+# 🔎 SKU Drill-down (entire dataset; no date filter)
 st.subheader("🔎 SKU Drill-down")
 
 agg_sorted = agg.sort_values(["Qty Purchased", "Product"], ascending=[False, True]).copy()
@@ -601,10 +539,8 @@ if selected_sku != "(Choose a product)":
     row = agg_sorted.loc[agg_sorted["SKU"] == selected_sku].iloc[0]
     sel_code, sel_product = row["Code"], row["Product"]
 
-    # Filter transactions for this SKU within current filters
     hist = tx_f[(tx_f["Code"].astype(str) == str(sel_code)) & (tx_f["Product"] == sel_product)].copy()
 
-    # Per-transaction bonus %
     if "Bonus %" in hist.columns:
         hist["Bonus % (tx)"] = pd.to_numeric(hist["Bonus %"], errors="coerce").fillna(0).round(1)
     else:
@@ -612,18 +548,16 @@ if selected_sku != "(Choose a product)":
                                  pd.to_numeric(hist["Qty Purchased"], errors="coerce"))
                                 .replace([float("inf"), -float("inf")], 0) * 100).fillna(0).round(1)
 
-    # Format date for display
     if "Date" in hist.columns:
         hist["_sort_date"] = hist["Date"]
         hist["Date"] = hist["Date"].dt.strftime(DATE_FMT_DISPLAY)
 
-    # Tiny trend
-    st.markdown(f"**{selected_sku}** — history in selected period")
-    if len(hist) > 0:
-        trend = hist.sort_values("_sort_date" if "_sort_date" in hist else "Date")
+    st.markdown(f"**{selected_sku}** — complete history (all loaded data)")
+    if len(hist) > 0 and "_sort_date" in hist:
+        trend = hist.sort_values("_sort_date")
         fig_hist = px.line(
             trend,
-            x="_sort_date" if "_sort_date" in trend else "Date",
+            x="_sort_date",
             y="Qty Purchased",
             markers=True,
             title=None,
@@ -635,26 +569,19 @@ if selected_sku != "(Choose a product)":
         )
         st.plotly_chart(fig_hist, use_container_width=True)
 
-    # History table
     cols_hist = ["Date", "Supplier Name", "Qty Purchased", "Bonus", "Bonus % (tx)"]
     cols_hist = [c for c in cols_hist if c in hist.columns]
     st.dataframe(
-        hist.sort_values("_sort_date" if "_sort_date" in hist else "Date")[cols_hist],
+        (hist.sort_values("_sort_date") if "_sort_date" in hist else hist)[cols_hist],
         use_container_width=True, hide_index=True,
         column_config={
             "Qty Purchased": st.column_config.NumberColumn(format="%,d"),
             "Bonus": st.column_config.NumberColumn(format="%,d"),
-            "Bonus % (tx)": st.column_config.ProgressColumn(
-                "Bonus % (tx)",
-                format="%.1f%%",
-                min_value=0, max_value=100,
-            ),
+            "Bonus % (tx)": st.column_config.ProgressColumn("Bonus % (tx)", format="%.1f%%", min_value=0, max_value=100),
         },
     )
 
-# -------------------------------------------------
-# Raw transactions (filtered) with MM/DD/YYYY display
-# -------------------------------------------------
+# Raw transactions (filtered by supplier/search only)
 with st.expander("🧾 View all filtered transactions"):
     show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %","__sheet__"]
     show_cols = [c for c in show_cols if c in tx_f.columns or c == "__sheet__"]
@@ -663,7 +590,7 @@ with st.expander("🧾 View all filtered transactions"):
         tx_show["__sheet__"] = "sheet"
     tx_show = tx_show[show_cols]
     if "Date" in tx_show.columns:
-        tx_show["_sort_date"] = tx_show["Date"]  # for correct sort
+        tx_show["_sort_date"] = tx_show["Date"]
         tx_show["Date"] = tx_show["Date"].dt.strftime(DATE_FMT_DISPLAY)
         tx_show = tx_show.sort_values(["__sheet__", "Product", "_sort_date"]).drop(columns=["_sort_date"])
     st.dataframe(
@@ -672,11 +599,7 @@ with st.expander("🧾 View all filtered transactions"):
         column_config={
             "Qty Purchased": st.column_config.NumberColumn(format="%,d"),
             "Bonus": st.column_config.NumberColumn(format="%,d"),
-            "Bonus %": st.column_config.ProgressColumn(
-                "Bonus %",
-                format="%.1f%%",
-                min_value=0, max_value=100,
-            ),
+            "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
         },
     )
 
