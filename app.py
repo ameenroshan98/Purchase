@@ -432,7 +432,7 @@ st.divider()
 # Charts (use current view)
 # -------------------------------------------------
 chart_df = agg_view.sort_values("Qty Purchased", ascending=False)
-if top_n := (None if scope == "All" else top_n):
+if scope == "Top-N" and top_n is not None:
     chart_df = chart_df.head(top_n)
 chart_df["Label"] = chart_df.apply(lambda r: short_label(r["Code"], r["Product"]), axis=1)
 
@@ -515,4 +515,157 @@ st.divider()
 # Highlights
 # -------------------------------------------------
 st.subheader("Highlights")
-left, right = st.columns(
+left, right = st.columns(2)
+
+with left:
+    st.markdown("**Top by Volume (Qty Purchased)**")
+    t1 = agg_view.sort_values("Qty Purchased", ascending=False).head(10)[
+        ["Status", "Code", "Product", "Qty Purchased", "Bonus Received",
+         "Times Purchased", "Avg Days Between", "Bonus %", "Status Note"]
+    ]
+    st.dataframe(
+        t1,
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Qty Purchased": st.column_config.NumberColumn(format="%,d"),
+            "Bonus Received": st.column_config.NumberColumn(format="%,d"),
+            "Avg Days Between": st.column_config.NumberColumn(format="%.1f"),
+            "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
+        },
+    )
+
+with right:
+    st.markdown("**Top by Bonus % (min 100 units)**")
+    t2 = agg_view[agg_view["Qty Purchased"] >= 100].sort_values("Bonus %", ascending=False).head(10)[
+        ["Status", "Code", "Product", "Qty Purchased", "Bonus Received",
+         "Times Purchased", "Avg Days Between", "Bonus %", "Status Note"]
+    ]
+    st.dataframe(
+        t2,
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Qty Purchased": st.column_config.NumberColumn(format="%,d"),
+            "Bonus Received": st.column_config.NumberColumn(format="%,d"),
+            "Avg Days Between": st.column_config.NumberColumn(format="%.1f"),
+            "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
+        },
+    )
+
+st.divider()
+
+# -------------------------------------------------
+# Detailed Products table
+# -------------------------------------------------
+st.subheader(f"Detailed Products ({len(agg_view):,})")
+cols = [
+    "Status","Code","Product","Qty Purchased","Bonus Received",
+    "Times Purchased","Times Bonus","Avg Purchase Qty","Avg Bonus Qty",
+    "Avg Days Between","Bonus %","Bonus Presence Rate","Bonus Variability (pp)","Status Note"
+]
+present = [c for c in cols if c in agg_view.columns]
+st.dataframe(
+    agg_view[present].sort_values("Qty Purchased", ascending=False),
+    use_container_width=True, hide_index=True,
+    column_config={
+        "Qty Purchased": st.column_config.NumberColumn(format="%,d"),
+        "Bonus Received": st.column_config.NumberColumn(format="%,d"),
+        "Times Purchased": st.column_config.NumberColumn(format="%,d"),
+        "Times Bonus": st.column_config.NumberColumn(format="%,d"),
+        "Avg Purchase Qty": st.column_config.NumberColumn(format="%.1f"),
+        "Avg Bonus Qty": st.column_config.NumberColumn(format="%.1f"),
+        "Avg Days Between": st.column_config.NumberColumn(format="%.1f"),
+        "Bonus Presence Rate": st.column_config.NumberColumn(format="%.2f"),
+        "Bonus Variability (pp)": st.column_config.NumberColumn(format="%.1f"),
+        "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
+    },
+)
+
+st.divider()
+
+# -------------------------------------------------
+# 🔎 SKU Drill-down
+# -------------------------------------------------
+st.subheader("🔎 SKU Drill-down")
+
+agg_sorted = agg_view.sort_values(["Qty Purchased", "Product"], ascending=[False, True]).copy()
+agg_sorted["SKU"] = agg_sorted["Code"].astype(str) + " — " + agg_sorted["Product"].astype(str)
+sku_list = agg_sorted["SKU"].tolist()
+
+selected_sku = st.selectbox("Select a product to view its purchase history:", ["(Choose a product)"] + sku_list, index=0)
+if selected_sku != "(Choose a product)":
+    row = agg_sorted.loc[agg_sorted["SKU"] == selected_sku].iloc[0]
+    sel_code, sel_product = row["Code"], row["Product"]
+
+    hist = tx_f[(tx_f["Code"].astype(str) == str(sel_code)) & (tx_f["Product"] == sel_product)].copy()
+
+    if "Bonus %" in hist.columns:
+        hist["Bonus % (tx)"] = pd.to_numeric(hist["Bonus %"], errors="coerce").fillna(0).round(1)
+    else:
+        hist["Bonus % (tx)"] = ((pd.to_numeric(hist["Bonus"], errors="coerce") /
+                                 pd.to_numeric(hist["Qty Purchased"], errors="coerce"))
+                                .replace([float("inf"), -float("inf")], 0) * 100).fillna(0).round(1)
+
+    if "Date" in hist.columns:
+        hist["_sort_date"] = hist["Date"]
+        hist["Date"] = hist["Date"].dt.strftime(DATE_FMT_DISPLAY)
+
+    st.markdown(f"**{selected_sku}** — history in selected period")
+    if len(hist) > 0 and "_sort_date" in hist:
+        trend = hist.sort_values("_sort_date")
+        fig_hist = px.line(
+            trend,
+            x="_sort_date",
+            y="Qty Purchased",
+            markers=True,
+            title=None,
+        )
+        fig_hist.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            xaxis_title="Date",
+            yaxis_title="Qty Purchased",
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    cols_hist = ["Date", "Supplier Name", "Qty Purchased", "Bonus", "Bonus % (tx)"]
+    cols_hist = [c for c in cols_hist if c in hist.columns]
+    st.dataframe(
+        (hist.sort_values("_sort_date") if "_sort_date" in hist else hist)[cols_hist],
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Qty Purchased": st.column_config.NumberColumn(format="%,d"),
+            "Bonus": st.column_config.NumberColumn(format="%,d"),
+            "Bonus % (tx)": st.column_config.ProgressColumn("Bonus % (tx)", format="%.1f%%", min_value=0, max_value=100),
+        },
+    )
+
+# -------------------------------------------------
+# Raw transactions (filtered) + Download summary
+# -------------------------------------------------
+with st.expander("🧾 View all filtered transactions"):
+    show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %","__sheet__"]
+    show_cols = [c for c in show_cols if c in tx_f.columns or c == "__sheet__"]
+    tx_show = tx_f.copy()
+    if "__sheet__" not in tx_show.columns:
+        tx_show["__sheet__"] = "sheet"
+    tx_show = tx_show[show_cols]
+    if "Date" in tx_show.columns:
+        tx_show["_sort_date"] = tx_show["Date"]
+        tx_show["Date"] = tx_show["Date"].dt.strftime(DATE_FMT_DISPLAY)
+        tx_show = tx_show.sort_values(["__sheet__", "Product", "_sort_date"]).drop(columns=["_sort_date"])
+    st.dataframe(
+        tx_show,
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Qty Purchased": st.column_config.NumberColumn(format="%,d"),
+            "Bonus": st.column_config.NumberColumn(format="%,d"),
+            "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
+        },
+    )
+
+csv_cols = [
+    "Status","Code","Product","Qty Purchased","Bonus Received",
+    "Times Purchased","Times Bonus","Avg Purchase Qty","Avg Bonus Qty",
+    "Avg Days Between","Bonus %","Bonus Presence Rate","Bonus Variability (pp)","Status Note"
+]
+csv_agg = agg_view[[c for c in csv_cols if c in agg_view.columns]].to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download product summary (CSV)", csv_agg, "product_summary.csv", "text/csv")
