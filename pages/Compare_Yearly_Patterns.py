@@ -132,22 +132,25 @@ def load_all(prefer="mdy"):
 
 # --------- Range utilities ----------
 def month_agg(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
-    """Filter df by [start_ts, end_ts], group monthly, and create MonthIndex starting at 1."""
+    """Filter df by [start_ts, end_ts], group monthly, return MonthIndex + MonthLabel ('Jan', 'Feb', …)."""
     msk = df["Date"].between(start_ts, end_ts, inclusive="both")
     d = df.loc[msk].copy()
     if d.empty:
         return pd.DataFrame({
-            "MonthIndex": [], "MonthStart": [], "Qty_Purchased": [], "Bonus_Received": [], "Bonus %": []
+            "MonthIndex": [], "MonthStart": [], "MonthLabel": [],
+            "Qty_Purchased": [], "Bonus_Received": [], "Bonus %": []
         })
 
     d["MonthStart"] = d["Date"].values.astype("datetime64[M]")
     g = (d.groupby("MonthStart", as_index=False)
            .agg(Qty_Purchased=("Qty Purchased", "sum"),
                 Bonus_Received=("Bonus", "sum")))
-    g["Bonus %"] = (g["Bonus_Received"] / g["Qty_Purchased"] * 100).replace([float("inf"), -float("inf")], 0).fillna(0.0)
+    g["Bonus %"] = (g["Bonus_Received"] / g["Qty_Purchased"] * 100)\
+                    .replace([float("inf"), -float("inf")], 0).fillna(0.0)
     g = g.sort_values("MonthStart").reset_index(drop=True)
     g["MonthIndex"] = g.index + 1
-    return g[["MonthIndex", "MonthStart", "Qty_Purchased", "Bonus_Received", "Bonus %"]]
+    g["MonthLabel"] = g["MonthStart"].dt.strftime("%b")
+    return g[["MonthIndex", "MonthStart", "MonthLabel", "Qty_Purchased", "Bonus_Received", "Bonus %"]]
 
 def totals(df_month: pd.DataFrame):
     t_qty = int(df_month["Qty_Purchased"].sum()) if not df_month.empty else 0
@@ -287,6 +290,11 @@ m_b = month_agg(tx_f, start_ts_b, end_ts_b)
 tqty_a, tbon_a, tpct_a = totals(m_a)
 tqty_b, tbon_b, tpct_b = totals(m_b)
 
+# Prepare a unified category order for MonthLabel across both ranges
+labels_order = pd.concat([m_a[["MonthIndex","MonthLabel"]],
+                          m_b[["MonthIndex","MonthLabel"]]], ignore_index=True)\
+                  .sort_values("MonthIndex")["MonthLabel"].drop_duplicates().tolist()
+
 # KPI row
 k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric(f"Qty A ({start_ts_a.strftime(DATE_FMT_DISPLAY)} → {end_ts_a.strftime(DATE_FMT_DISPLAY)})", f"{tqty_a:,}")
@@ -299,42 +307,39 @@ k6.metric("Bonus % B", f"{tpct_b:.1f}%", delta=f"{tpct_b - tpct_a:+.1f} pp")
 
 st.divider()
 
-# Charts — aligned by MonthIndex (1..N for each range) so lengths can differ
+# Charts — x = Month name (not numbers)
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("Monthly Qty Purchased")
     dd_q = pd.concat([m_a.assign(Range="A"), m_b.assign(Range="B")], ignore_index=True)
-    fig_q = px.line(dd_q, x="MonthIndex", y="Qty_Purchased", color="Range",
-                    markers=True, hover_data={"MonthIndex": True, "MonthStart": True})
+    fig_q = px.line(dd_q, x="MonthLabel", y="Qty_Purchased", color="Range",
+                    markers=True, hover_data={"MonthLabel": True, "MonthStart": True})
     fig_q.update_layout(margin=dict(l=10, r=10, t=10, b=10),
-                        xaxis=dict(tickmode="linear", tick0=1, dtick=1))
+                        xaxis_title="Month",
+                        xaxis={'categoryorder': 'array', 'categoryarray': labels_order})
     st.plotly_chart(fig_q, use_container_width=True)
 
 with c2:
     st.subheader("Monthly Bonus")
-    fig_b = px.line(dd_q, x="MonthIndex", y="Bonus_Received", color="Range",
-                    markers=True, hover_data={"MonthIndex": True, "MonthStart": True})
+    fig_b = px.line(dd_q, x="MonthLabel", y="Bonus_Received", color="Range",
+                    markers=True, hover_data={"MonthLabel": True, "MonthStart": True})
     fig_b.update_layout(margin=dict(l=10, r=10, t=10, b=10),
-                        xaxis=dict(tickmode="linear", tick0=1, dtick=1))
+                        xaxis_title="Month",
+                        xaxis={'categoryorder': 'array', 'categoryarray': labels_order})
     st.plotly_chart(fig_b, use_container_width=True)
 
 st.subheader("Monthly Bonus %")
 dd_bp = pd.concat([m_a.assign(Range="A"), m_b.assign(Range="B")], ignore_index=True)
-fig_bp = px.line(dd_bp, x="MonthIndex", y="Bonus %", color="Range", markers=True,
-                 hover_data={"MonthIndex": True, "MonthStart": True})
+fig_bp = px.line(dd_bp, x="MonthLabel", y="Bonus %", color="Range", markers=True,
+                 hover_data={"MonthLabel": True, "MonthStart": True})
 fig_bp.update_layout(margin=dict(l=10, r=10, t=10, b=10),
-                     xaxis=dict(tickmode="linear", tick0=1, dtick=1))
-st.plotly_chart(fig_bp, use_container_width=True)
-
-st.divider()
-
-# (after fig_bp …)
+                     xaxis_title="Month",
+                     xaxis={'categoryorder': 'array', 'categoryarray': labels_order})
 st.plotly_chart(fig_bp, use_container_width=True)
 
 st.divider()
 
 # ===================== SKU Bonus % Movers =====================
-# … (rest of your movers code unchanged)
 
 # Per-SKU aggregates for each range
 a_sku = sku_agg_range(tx_f, start_ts_a, end_ts_a).rename(
@@ -349,7 +354,6 @@ comp["Total Qty (A+B)"] = (comp["Qty A"] + comp["Qty B"]).astype(int)
 comp["Δ Bonus % (pp)"] = (comp["Bonus % B"] - comp["Bonus % A"]).round(1)
 
 # Apply minimum combined quantity to reduce noise
-# Sensible default if slider wasn't created for some reason
 min_combined_qty = int('min_combined_qty' in locals() and min_combined_qty or 100)
 comp_f = comp[comp["Total Qty (A+B)"] >= min_combined_qty].copy()
 
