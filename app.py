@@ -3,19 +3,31 @@ import streamlit as st
 st.set_page_config(page_title="Purchase Dashboard", layout="wide")  # must be first Streamlit call
 
 import streamlit_authenticator as stauth
+import inspect
 import pandas as pd
 import requests
 from io import BytesIO
 import plotly.express as px
 import re
 
-# -----------------------------
-# Authentication (uses st.secrets)
-# -----------------------------
-import streamlit as st
-import streamlit_authenticator as stauth
+# =============================
+# Authentication (robust block)
+# =============================
+# Secrets TOML expected:
+# [cookie]
+# name = "purchase_dash_auth"
+# key = "your-long-random-secret"
+# expiry_days = 14
+#
+# [credentials.usernames.admin]
+# name = "Admin User"
+# password = "$2b$12$BCRYPT_HASH..."
+#
+# [credentials.usernames.analyst]
+# name = "Analyst"
+# password = "$2b$12$BCRYPT_HASH..."
 
-# Build credentials (supports the [credentials.usernames.*] TOML layout)
+# Build credentials dict from st.secrets
 _creds = {"usernames": {}}
 for uname, u in st.secrets["credentials"]["usernames"].items():
     _creds["usernames"][uname] = {
@@ -23,21 +35,29 @@ for uname, u in st.secrets["credentials"]["usernames"].items():
         "password": str(u["password"]),
     }
 
-# Read cookie settings safely and coerce types
+# Read cookie settings and coerce types
 cookie_cfg = st.secrets.get("cookie", {})
 cookie_name = str(cookie_cfg.get("name", "purchase_dash_auth"))
 cookie_key = str(cookie_cfg.get("key", "change-this-secret"))
-# Secrets may deliver numbers as strings on some hosts—force int
 try:
     cookie_expiry_days = int(cookie_cfg.get("expiry_days", 14))
 except Exception:
     cookie_expiry_days = 14
 
+# Detect constructor signature for your installed streamlit-authenticator
+init_sig = inspect.signature(stauth.Authenticate.__init__)
+kw = {}
+if "cookie_expiry_days" in init_sig.parameters:
+    kw["cookie_expiry_days"] = cookie_expiry_days
+elif "expiry_days" in init_sig.parameters:  # older versions
+    kw["expiry_days"] = cookie_expiry_days
+# else: let library default
+
 _authenticator = stauth.Authenticate(
     credentials=_creds,
     cookie_name=cookie_name,
     key=cookie_key,
-    cookie_expiry_days=cookie_expiry_days,
+    **kw,
 )
 
 name, auth_status, username = _authenticator.login("Login", "main")
@@ -339,7 +359,7 @@ agg_base = (
         .agg(
             Qty_Purchased=("Qty Purchased", "sum"),
             Bonus_Received=("Bonus", "sum"),
-            Times_Purchased=("Product", "count"),   # count rows regardless of date
+            Times_Purchased=("Product", "count"),
             Times_Bonus=("Bonus", lambda s: (s > 0).sum()),
             Avg_Purchase_Qty=("Qty Purchased", "mean"),
             Avg_Bonus_Qty=("Bonus", "mean"),
