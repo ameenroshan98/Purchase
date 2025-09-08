@@ -1,3 +1,30 @@
+import streamlit as st
+import streamlit_authenticator as stauth
+
+# ---- Build credentials from st.secrets (matches credentials.usernames.* in your TOML)
+_creds = {"usernames": {}}
+for uname, u in st.secrets["credentials"]["usernames"].items():
+    _creds["usernames"][uname] = {"name": u["name"], "password": u["password"]}
+
+_authenticator = stauth.Authenticate(
+    credentials=_creds,
+    cookie_name=st.secrets["cookie"]["name"],
+    key=st.secrets["cookie"]["key"],
+    cookie_expiry_days=st.secrets["cookie"]["expiry_days"],
+)
+
+name, auth_status, username = _authenticator.login("Login", "main")  # or "sidebar"
+
+if auth_status is False:
+    st.error("Username/password is incorrect.")
+    st.stop()
+elif auth_status is None:
+    st.info("Please enter your username and password.")
+    st.stop()
+
+# Optional: show logout + who’s signed in
+_authenticator.logout("Logout", "sidebar")
+st.sidebar.caption(f"Signed in as **{name}**")
 # app.py
 import streamlit as st
 import pandas as pd
