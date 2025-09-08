@@ -345,7 +345,16 @@ b_sku = sku_agg_range(tx_f, start_ts_b, end_ts_b).rename(
     columns={"Qty": "Qty B", "Bonus": "Bonus B", "Bonus %": "Bonus % B"}
 )
 
-comp = a_sku.merge(b_sku, on=["Code", "Product"], how="outer").fillna(0)
+# Merge WITHOUT filling, then require presence in both periods
+comp = a_sku.merge(b_sku, on=["Code", "Product"], how="outer")
+both_mask = comp["Qty A"].notna() & comp["Qty B"].notna()
+comp = comp.loc[both_mask].copy()
+
+# Now fill NaNs for safe arithmetic
+for c in ["Qty A","Bonus A","Bonus % A","Qty B","Bonus B","Bonus % B"]:
+    if c in comp.columns:
+        comp[c] = pd.to_numeric(comp[c], errors="coerce").fillna(0)
+
 comp["Total Qty (A+B)"] = (comp["Qty A"] + comp["Qty B"]).astype(int)
 comp["Δ Bonus % (pp)"] = (comp["Bonus % B"] - comp["Bonus % A"]).astype(float).round(1)
 
@@ -359,7 +368,7 @@ decreases = comp_f[comp_f["Δ Bonus % (pp)"] < 0].sort_values("Δ Bonus % (pp)",
 
 st.subheader("🔼 SKUs with Bonus % Increased (Top 25)")
 if increases.empty:
-    st.info("No SKUs show an increase in Bonus % under the current filters.")
+    st.info("No SKUs show an increase in Bonus % (present in both periods) under the current filters.")
 else:
     st.dataframe(
         increases[[
@@ -383,7 +392,7 @@ else:
 
 st.subheader("🔻 SKUs with Bonus % Decreased (Top 25)")
 if decreases.empty:
-    st.info("No SKUs show a decrease in Bonus % under the current filters.")
+    st.info("No SKUs show a decrease in Bonus % (present in both periods) under the current filters.")
 else:
     st.dataframe(
         decreases[[
