@@ -1,7 +1,30 @@
+# app.py
 import streamlit as st
-import streamlit_authenticator as stauth
+st.set_page_config(page_title="Purchase Dashboard", layout="wide")  # must be first Streamlit call
 
-# ---- Build credentials from st.secrets (matches credentials.usernames.* in your TOML)
+import streamlit_authenticator as stauth
+import pandas as pd
+import requests
+from io import BytesIO
+import plotly.express as px
+import re
+
+# -----------------------------
+# Authentication (uses st.secrets)
+# -----------------------------
+# Expected TOML structure:
+# [cookie]
+# name = "purchase_dash_auth"
+# key = "your-long-random-secret"
+# expiry_days = 14
+#
+# [credentials.usernames.admin]
+# name = "Admin User"
+# password = "$2b$12$BCRYPT_HASH..."
+#
+# [credentials.usernames.analyst]
+# name = "Analyst"
+# password = "$2b$12$BCRYPT_HASH..."
 _creds = {"usernames": {}}
 for uname, u in st.secrets["credentials"]["usernames"].items():
     _creds["usernames"][uname] = {"name": u["name"], "password": u["password"]}
@@ -13,7 +36,7 @@ _authenticator = stauth.Authenticate(
     cookie_expiry_days=st.secrets["cookie"]["expiry_days"],
 )
 
-name, auth_status, username = _authenticator.login("Login", "main")  # or "sidebar"
+name, auth_status, username = _authenticator.login("Login", "main")
 
 if auth_status is False:
     st.error("Username/password is incorrect.")
@@ -22,23 +45,12 @@ elif auth_status is None:
     st.info("Please enter your username and password.")
     st.stop()
 
-# Optional: show logout + who’s signed in
 _authenticator.logout("Logout", "sidebar")
 st.sidebar.caption(f"Signed in as **{name}**")
-# app.py
-import streamlit as st
-import pandas as pd
-import requests
-from io import BytesIO
-import plotly.express as px
-import re
 
 # -------------------------------------------------
-# Page config
-# -------------------------------------------------
-st.set_page_config(page_title="Purchase Dashboard", layout="wide")
-
 # Quick link to the comparison page
+# -------------------------------------------------
 try:
     st.page_link("pages/Compare_Yearly_Patterns.py", label="📅 Compare Ranges (Purchase vs Bonus)")
 except Exception:
@@ -443,7 +455,8 @@ st.markdown(
 - 🟢 **Core** — Stable demand; buy steadily and negotiate base price.  
 - 🟠 **Promo-timed** — Buy during bonus windows; avoid outside promos.  
 - 🔴 **Review** — Dormant/anomalous; verify demand, data, or supplier terms.
-""")
+"""
+)
 
 st.divider()
 
@@ -516,9 +529,9 @@ with colB:
             size="Qty Purchased", color="Status",
             hover_name="Label", height=420
         )
-        # ---- Dynamic Y max: never exceed 100%, add headroom if small
+        # ---- Dynamic Y max: never exceed 500%, add ~15% headroom if small
         max_pct = float(pd.to_numeric(bub["Bonus %"], errors="coerce").max() or 0)
-        y_upper = min(100.0, max(10.0, max_pct * 1.15))
+        y_upper = min(500.0, max(10.0, max_pct * 1.15))
         fig_bub.update_yaxes(range=[0, y_upper])
         fig_bub.add_hline(y=10, line_dash="dot", annotation_text="10% ref")
         fig_bub.update_layout(margin=dict(l=10, r=10, t=30, b=10),
