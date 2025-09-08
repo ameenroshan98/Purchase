@@ -12,28 +12,32 @@ import re
 # -----------------------------
 # Authentication (uses st.secrets)
 # -----------------------------
-# Expected TOML structure:
-# [cookie]
-# name = "purchase_dash_auth"
-# key = "your-long-random-secret"
-# expiry_days = 14
-#
-# [credentials.usernames.admin]
-# name = "Admin User"
-# password = "$2b$12$BCRYPT_HASH..."
-#
-# [credentials.usernames.analyst]
-# name = "Analyst"
-# password = "$2b$12$BCRYPT_HASH..."
+import streamlit as st
+import streamlit_authenticator as stauth
+
+# Build credentials (supports the [credentials.usernames.*] TOML layout)
 _creds = {"usernames": {}}
 for uname, u in st.secrets["credentials"]["usernames"].items():
-    _creds["usernames"][uname] = {"name": u["name"], "password": u["password"]}
+    _creds["usernames"][uname] = {
+        "name": str(u["name"]),
+        "password": str(u["password"]),
+    }
+
+# Read cookie settings safely and coerce types
+cookie_cfg = st.secrets.get("cookie", {})
+cookie_name = str(cookie_cfg.get("name", "purchase_dash_auth"))
+cookie_key = str(cookie_cfg.get("key", "change-this-secret"))
+# Secrets may deliver numbers as strings on some hosts—force int
+try:
+    cookie_expiry_days = int(cookie_cfg.get("expiry_days", 14))
+except Exception:
+    cookie_expiry_days = 14
 
 _authenticator = stauth.Authenticate(
     credentials=_creds,
-    cookie_name=st.secrets["cookie"]["name"],
-    key=st.secrets["cookie"]["key"],
-    cookie_expiry_days=st.secrets["cookie"]["expiry_days"],
+    cookie_name=cookie_name,
+    key=cookie_key,
+    cookie_expiry_days=cookie_expiry_days,
 )
 
 name, auth_status, username = _authenticator.login("Login", "main")
