@@ -181,7 +181,7 @@ def load_transactions(prefer="mdy"):
     return df_all
 
 # -------------------------------------------------
-# UI & Analytics (NO DATE FILTER)
+# UI & Analytics (WITH DATE FILTER)
 # -------------------------------------------------
 tx = load_transactions(prefer="mdy")
 
@@ -191,7 +191,7 @@ if tx.empty or "Code" not in tx.columns or "Product" not in tx.columns:
     st.warning("No data found or required columns missing (Code/Product).")
     st.stop()
 
-# Diagnostics
+# Diagnostics + global date bounds
 min_date = tx["Date"].min(skipna=True) if "Date" in tx.columns else None
 max_date = tx["Date"].max(skipna=True) if "Date" in tx.columns else None
 cap = []
@@ -213,7 +213,7 @@ if "Date" in tx.columns and tx["Date"].isna().sum() > 0:
     with st.expander("⚠️ Examples of unparseable dates"):
         st.write(bad)
 
-# Sidebar filters (NO date UI)
+# Sidebar filters (now includes DATE RANGE)
 with st.sidebar:
     st.header("Filters")
     sup_series = tx.get("Supplier Name", pd.Series("", index=tx.index)).astype(str).str.strip()
@@ -226,9 +226,23 @@ with st.sidebar:
 
     q = st.text_input("Search (code or product)", "")
 
+    # Date range filter (if we have valid dates)
+    include_missing_dates = False
+    if pd.notna(min_date) and pd.notna(max_date):
+        start_d, end_d = st.date_input(
+            "Date range",
+            value=(min_date.date(), max_date.date()),
+            min_value=min_date.date(),
+            max_value=max_date.date(),
+            format="MM/DD/YYYY",
+        )
+        include_missing_dates = st.checkbox("Include rows with missing Date", value=False)
+    else:
+        start_d = end_d = None
+
     bonus_filter = st.selectbox("Bonus filter", ["All", "With Bonus", "Without Bonus"])
 
-    # Min-qty slider max based on supplier/search slice
+    # Min-qty slider max based on supplier/search slice (ignores date for preview simplicity)
     mask_preview = pd.Series(True, index=tx.index)
     if selected_supplier != "All suppliers":
         mask_preview &= (sup_series == selected_supplier)
@@ -253,7 +267,7 @@ with st.sidebar:
     else:
         top_n = None
 
-# Build transaction-level mask (supplier + search only)
+# Build transaction-level mask (supplier + search + DATE)
 mask_tx = pd.Series(True, index=tx.index)
 if selected_supplier != "All suppliers":
     mask_tx &= (sup_series == selected_supplier)
@@ -263,12 +277,20 @@ if q.strip():
         tx.get("Product", pd.Series("", index=tx.index)).astype(str).str.lower().str.contains(ql, na=False)
         | tx.get("Code", pd.Series("", index=tx.index)).astype(str).str.contains(ql, na=False)
     )
+# Apply date range (if present)
+if "Date" in tx.columns and pd.notna(min_date) and pd.notna(max_date) and start_d and end_d:
+    s_ts, e_ts = pd.Timestamp(start_d).normalize(), pd.Timestamp(end_d).normalize()
+    date_mask = tx["Date"].between(s_ts, e_ts, inclusive="both")
+    if include_missing_dates:
+        date_mask = date_mask | tx["Date"].isna()
+    mask_tx &= date_mask
+
 tx_f = tx[mask_tx].copy()
 if tx_f.empty:
-    st.info("No transactions match your supplier/search filters.")
+    st.info("No transactions match your filters (including date range).")
     st.stop()
 
-# Aggregate to PRODUCT level (whole dataset)
+# Aggregate to PRODUCT level (filtered dataset)
 agg_base = (
     tx_f.groupby(["Code", "Product"], as_index=False)
         .agg(
@@ -322,9 +344,9 @@ agg = agg_base.merge(gap_series, on=["Code","Product"], how="left").merge(var_df
 agg["Bonus %"] = (agg["Bonus Received"] / agg["Qty Purchased"] * 100).replace([pd.NA, pd.NaT, float("inf")], 0).fillna(0).round(1)
 agg["Avg Days Between"] = agg["Avg Days Between"].round(1)
 
-# Recency vs latest date found
-if "Date" in tx.columns and pd.notna(tx["Date"]).any():
-    end_norm = tx["Date"].dropna().max().normalize()
+# Recency vs latest date found (of filtered set)
+if "Date" in tx_f.columns and pd.notna(tx_f["Date"]).any():
+    end_norm = tx_f["Date"].dropna().max().normalize()
     agg["Recency Days"] = (end_norm - agg["Last Purchase Date"]).dt.days
 else:
     agg["Recency Days"] = pd.NA
@@ -340,7 +362,7 @@ elif bonus_filter == "Without Bonus":
     agg = agg[agg["Bonus %"] == 0]
 
 if agg.empty:
-    st.info("No products after Min Qty / Bonus filter. Adjust filters.")
+    st.info("No products after Min Qty / Bonus / Date filters. Adjust filters.")
     st.stop()
 
 # 3-status classification (Core / Promo-timed / Review)
@@ -370,7 +392,7 @@ STATUS_COPY = {
 }
 agg[["Status", "Status Note"]] = agg["StatusKey"].apply(lambda k: pd.Series(STATUS_COPY[k]))
 
-# Status filter (kept; not date-related)
+# Status filter
 with st.sidebar:
     status_choice = st.selectbox("Status", ["(All)", "🟢 Core", "🟠 Promo-timed", "🔴 Review"], index=0)
 if status_choice != "(All)":
@@ -386,6 +408,15 @@ c1.metric("Products (after filters)", f"{len(agg):,}")
 c2.metric("Total Purchased", f"{total_purchased:,}")
 c3.metric("Total Bonus", f"{total_bonus:,}")
 c4.metric("Overall Bonus %", f"{overall_bonus_rate:.1f}%")
+
+# ---- Status definitions (always visible, compact)
+st.markdown(
+    """
+**Status definitions:**  
+- 🟢 **Core** — Stable demand; buy steadily and negotiate base price.  
+- 🟠 **Promo-timed** — Buy during bonus windows; avoid outside promos.  
+- 🔴 **Review** — Dormant/anomalous; verify demand, data, or supplier terms.
+""")
 
 st.divider()
 
@@ -458,6 +489,10 @@ with colB:
             size="Qty Purchased", color="Status",
             hover_name="Label", height=420
         )
+        # ---- Dynamic Y max: never exceed 100%, add headroom if small
+        max_pct = float(pd.to_numeric(bub["Bonus %"], errors="coerce").max() or 0)
+        y_upper = min(100.0, max(10.0, max_pct * 1.15))
+        fig_bub.update_yaxes(range=[0, y_upper])
         fig_bub.add_hline(y=10, line_dash="dot", annotation_text="10% ref")
         fig_bub.update_layout(margin=dict(l=10, r=10, t=30, b=10),
                               xaxis_title="Qty Purchased", yaxis_title="Bonus %")
@@ -534,7 +569,7 @@ st.dataframe(
 
 st.divider()
 
-# 🔎 SKU Drill-down (entire dataset; no date filter)
+# 🔎 SKU Drill-down (entire dataset; respects current filters)
 st.subheader("🔎 SKU Drill-down")
 
 agg_sorted = agg.sort_values(["Qty Purchased", "Product"], ascending=[False, True]).copy()
@@ -559,7 +594,7 @@ if selected_sku != "(Choose a product)":
         hist["_sort_date"] = hist["Date"]
         hist["Date"] = hist["Date"].dt.strftime(DATE_FMT_DISPLAY)
 
-    st.markdown(f"**{selected_sku}** — complete history (all loaded data)")
+    st.markdown(f"**{selected_sku}** — history in selected filters")
     if len(hist) > 0 and "_sort_date" in hist:
         trend = hist.sort_values("_sort_date")
         fig_hist = px.line(
@@ -588,7 +623,7 @@ if selected_sku != "(Choose a product)":
         },
     )
 
-# Raw transactions (filtered by supplier/search only)
+# Raw transactions (filtered table)
 with st.expander("🧾 View all filtered transactions"):
     show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %","__sheet__"]
     show_cols = [c for c in show_cols if c in tx_f.columns or c == "__sheet__"]
