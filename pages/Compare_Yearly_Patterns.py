@@ -5,12 +5,14 @@ import requests
 from io import BytesIO
 import plotly.express as px
 import re
+from datetime import date, datetime, timedelta
 
-st.set_page_config(page_title="YoY Compare — Purchase vs Bonus", layout="wide")
+st.set_page_config(page_title="YoY (or Any Range) Compare — Purchase vs Bonus", layout="wide")
 
 # --- Shared config (same as main)
 SHEET_ID = "1R7o4xKMeYWcYWwAOorMyYDtjg0-74FqDK0xAFKN6Iuo"
 XLSX_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
+CSV_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=0"
 DATE_FMT_DISPLAY = "%m/%d/%Y"
 
 # ---------------- Helpers (copied from main for self-containment) ----------------
@@ -20,7 +22,6 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
          .str.replace("\u00A0", " ", regex=False)
          .str.strip()
          .str.replace(".", "/", regex=False))
-
     out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
 
     serial = pd.to_numeric(s, errors="coerce")
@@ -58,7 +59,6 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
         elif a > 12 and b > 12:
             return pd.NaT
         else:
-            # prefer MDY on ambiguous
             m, d, y = (a, b, c) if prefer.lower() != "dmy" else (b, a, c)
 
         try:
@@ -72,22 +72,30 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
 
 @st.cache_data(ttl=900)
 def load_all(prefer="mdy"):
-    r = requests.get(XLSX_URL, timeout=60)
-    r.raise_for_status()
-    with BytesIO(r.content) as bio:
-        book = pd.read_excel(bio, sheet_name=None, dtype=str)
-    frames = []
-    for sheet_name, df in book.items():
-        if df is None or df.empty:
-            continue
-        df = df.dropna(how="all")
-        df.columns = pd.Index(df.columns).astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
-        df["__sheet__"] = sheet_name
-        frames.append(df)
-    df_all = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    # Try full workbook (needs openpyxl). If not available, fallback to first tab CSV.
+    try:
+        r = requests.get(XLSX_URL, timeout=60)
+        r.raise_for_status()
+        with BytesIO(r.content) as bio:
+            book = pd.read_excel(bio, sheet_name=None, dtype=str)
+        frames = []
+        for sheet_name, df in book.items():
+            if df is None or df.empty:
+                continue
+            df = df.dropna(how="all")
+            df.columns = pd.Index(df.columns).astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+            df["__sheet__"] = sheet_name
+            frames.append(df)
+        df_all = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        fallback = False
+    except Exception:
+        df_all = pd.read_csv(CSV_URL, dtype=str).fillna("")
+        df_all.columns = pd.Index(df_all.columns).astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+        df_all["__sheet__"] = "gid_0"
+        fallback = True
 
     if df_all.empty:
-        return df_all
+        return df_all, fallback
 
     # Normalize headers
     rename_map = {
@@ -121,43 +129,70 @@ def load_all(prefer="mdy"):
                              .str.replace(",", "", regex=False))
         df_all["Bonus %"] = pd.to_numeric(df_all["Bonus %"], errors="coerce").fillna(0.0)
 
-    return df_all
+    return df_all, fallback
+
+# --------- Range utilities ----------
+def month_agg(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
+    """Filter df by [start_ts, end_ts], group monthly, and create MonthIndex starting at 1."""
+    msk = df["Date"].between(start_ts, end_ts, inclusive="both")
+    d = df.loc[msk].copy()
+    if d.empty:
+        return pd.DataFrame({
+            "MonthIndex": [], "MonthStart": [], "Qty_Purchased": [], "Bonus_Received": [], "Bonus %": []
+        })
+
+    d["MonthStart"] = d["Date"].values.astype("datetime64[M]")
+    g = (d.groupby("MonthStart", as_index=False)
+           .agg(Qty_Purchased=("Qty Purchased", "sum"),
+                Bonus_Received=("Bonus", "sum")))
+    g["Bonus %"] = (g["Bonus_Received"] / g["Qty_Purchased"] * 100).replace([float("inf"), -float("inf")], 0).fillna(0.0)
+    g = g.sort_values("MonthStart").reset_index(drop=True)
+    g["MonthIndex"] = g.index + 1
+    return g[["MonthIndex", "MonthStart", "Qty_Purchased", "Bonus_Received", "Bonus %"]]
+
+def totals(df_month: pd.DataFrame):
+    t_qty = int(df_month["Qty_Purchased"].sum()) if not df_month.empty else 0
+    t_bonus = int(df_month["Bonus_Received"].sum()) if not df_month.empty else 0
+    t_pct = (t_bonus / t_qty * 100) if t_qty > 0 else 0.0
+    return t_qty, t_bonus, t_pct
+
+def sku_agg_range(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
+    """Per-SKU totals (Qty, Bonus, Bonus %) in the given date range."""
+    msk = df["Date"].between(start_ts, end_ts, inclusive="both")
+    d = df.loc[msk].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["Code", "Product", "Qty", "Bonus", "Bonus %"])
+    g = (d.groupby(["Code", "Product"], as_index=False)
+           .agg(Qty=("Qty Purchased", "sum"),
+                Bonus=("Bonus", "sum")))
+    g["Bonus %"] = (g["Bonus"] / g["Qty"] * 100).replace([float("inf"), -float("inf")], 0).fillna(0.0)
+    return g
 
 # ------------------------------ UI ------------------------------
-st.title("🗓️ Year-over-Year Comparison — Purchase vs Bonus")
+st.title("🗓️ Year/Range Comparison — Purchase vs Bonus")
 
-tx = load_all(prefer="mdy")
+tx, used_fallback = load_all(prefer="mdy")
+if used_fallback:
+    st.warning("Workbook read fell back to first tab CSV (install `openpyxl` to load all tabs).")
 if tx.empty or "Code" not in tx.columns or "Product" not in tx.columns:
     st.warning("No data or missing required columns (Code/Product).")
     st.stop()
-
 if "Date" not in tx.columns or tx["Date"].notna().sum() == 0:
     st.info("No valid dates found. This page requires a Date column.")
     st.stop()
 
 tx["Year"] = tx["Date"].dt.year
-tx["Month"] = tx["Date"].dt.month
 
-# Sidebar filters
+# Sidebar filters (supplier/search + optional SKU)
 with st.sidebar:
     st.header("Filters")
-
     sup_series = tx.get("Supplier Name", pd.Series("", index=tx.index)).astype(str).str.strip()
     supplier_options = sorted([s for s in sup_series.unique() if s])
-    selected_supplier = st.selectbox(
-        "Supplier",
-        options=["All suppliers"] + supplier_options,
-        index=0
-    )
-
+    selected_supplier = st.selectbox("Supplier", ["All suppliers"] + supplier_options, index=0)
     q = st.text_input("Search (code or product)", "")
+    include_undated = st.checkbox("Include rows with missing Date (outside ranges)", value=False)
 
-    # Optional SKU pick for focused compare
-    # Build list after supplier/search filters are applied below
-    st.divider()
-    st.caption("Optional: lock to a single SKU for focused YoY view.")
-
-# Apply base mask (supplier + search)
+# Apply base mask first
 mask = pd.Series(True, index=tx.index)
 if selected_supplier != "All suppliers":
     mask &= (sup_series == selected_supplier)
@@ -167,162 +202,222 @@ if q.strip():
         tx.get("Product", pd.Series("", index=tx.index)).astype(str).str.lower().str.contains(ql, na=False)
         | tx.get("Code", pd.Series("", index=tx.index)).astype(str).str.contains(ql, na=False)
     )
-
-tx_f = tx[mask].copy()
+tx_f = tx[mask & tx["Date"].notna()].copy()  # for comparison we need valid dates
 if tx_f.empty:
     st.info("No transactions match your supplier/search filters.")
     st.stop()
 
-# SKU list (after filter)
+# Defaults for ranges: A = previous full calendar year, B = latest full calendar year
+dmin = tx_f["Date"].min().normalize()
+dmax = tx_f["Date"].max().normalize()
+latest_year = int(dmax.year)
+prev_year = latest_year - 1
+default_a = (pd.Timestamp(prev_year, 1, 1), pd.Timestamp(prev_year, 12, 31))
+default_b = (pd.Timestamp(latest_year, 1, 1), pd.Timestamp(latest_year, 12, 31))
+
+# Date pickers (MM/DD/YYYY) for A & B
+colA, colB = st.columns(2)
+with colA:
+    st.subheader("Range A")
+    start_a, end_a = st.date_input(
+        "Start / End (A)", value=(default_a[0].date(), default_a[1].date()),
+        min_value=dmin.date(), max_value=dmax.date(), format="MM/DD/YYYY"
+    )
+with colB:
+    st.subheader("Range B")
+    start_b, end_b = st.date_input(
+        "Start / End (B)", value=(default_b[0].date(), default_b[1].date()),
+        min_value=dmin.date(), max_value=dmax.date(), format="MM/DD/YYYY"
+    )
+
+# Optional SKU picker AFTER we know the slice universe
 sku_series = tx_f["Code"].astype(str) + " — " + tx_f["Product"].astype(str)
 sku_list = ["(All filtered SKUs)"] + sorted(sku_series.unique().tolist())
-
 with st.sidebar:
-    selected_sku = st.selectbox("SKU", sku_list, index=0)
+    selected_sku = st.selectbox("SKU (optional)", sku_list, index=0)
+
+# (NEW) Min combined quantity filter for the increase/decrease tables
+with st.sidebar:
+    # use overall combined qty to size the slider sensibly
+    overall_qty = int(tx_f.groupby(["Code","Product"])["Qty Purchased"].sum().max() or 0)
+    slider_max = max(overall_qty, 1000)
+    min_combined_qty = st.slider("Min combined Qty (A+B) for tables", 0, slider_max, 100, step=50)
 
 if selected_sku != "(All filtered SKUs)":
-    # parse "Code — Product"
     code_part = selected_sku.split(" — ", 1)[0]
     prod_part = selected_sku.split(" — ", 1)[1] if " — " in selected_sku else None
-    mask2 = tx_f["Code"].astype(str).eq(code_part)
+    sku_mask = tx_f["Code"].astype(str).eq(code_part)
     if prod_part:
-        mask2 &= tx_f["Product"].astype(str).eq(prod_part)
-    tx_f = tx_f[mask2].copy()
+        sku_mask &= tx_f["Product"].astype(str).eq(prod_part)
+    tx_f = tx_f[sku_mask].copy()
+    if tx_f.empty:
+        st.info("No rows for the chosen SKU in the selected filters.")
+        st.stop()
 
-# Year choices
-years = sorted(tx_f["Year"].dropna().unique())
-if len(years) < 2:
-    st.info("Need at least two years of data to compare.")
-    st.stop()
+# Build month aggregations for both ranges
+start_ts_a, end_ts_a = pd.Timestamp(start_a).normalize(), pd.Timestamp(end_a).normalize()
+start_ts_b, end_ts_b = pd.Timestamp(start_b).normalize(), pd.Timestamp(end_b).normalize()
 
-col_yr1, col_yr2 = st.columns(2)
-with col_yr1:
-    yr_a = st.selectbox("Year A", options=years, index=len(years)-1)
-with col_yr2:
-    # default to previous year if available
-    default_b = years.index(yr_a)-1 if yr_a in years and years.index(yr_a) > 0 else 0
-    yr_b = st.selectbox("Year B", options=[y for y in years if y != yr_a], index=default_b)
+m_a = month_agg(tx_f, start_ts_a, end_ts_a)
+m_b = month_agg(tx_f, start_ts_b, end_ts_b)
 
-# Aggregate monthly for each year
-def monthly_agg(df):
-    g = (df.groupby(["Year", "Month"], as_index=False)
-           .agg(Qty_Purchased=("Qty Purchased", "sum"),
-                Bonus_Received=("Bonus", "sum")))
-    g["Bonus %"] = (g["Bonus_Received"] / g["Qty_Purchased"] * 100).replace([pd.NA, float("inf")], 0).fillna(0.0)
-    return g
+tqty_a, tbon_a, tpct_a = totals(m_a)
+tqty_b, tbon_b, tpct_b = totals(m_b)
 
-m = monthly_agg(tx_f)
-m_a = m[m["Year"] == yr_a].set_index("Month").reindex(range(1,13)).reset_index().fillna(0)
-m_b = m[m["Year"] == yr_b].set_index("Month").reindex(range(1,13)).reset_index().fillna(0)
-
-# KPIs
-def totals_row(df, year):
-    t_qty = int(df.loc[df["Year"]==year, "Qty_Purchased"].sum())
-    t_bonus = int(df.loc[df["Year"]==year, "Bonus_Received"].sum())
-    t_bpct = (t_bonus / t_qty * 100) if t_qty > 0 else 0
-    return t_qty, t_bonus, t_bpct
-
-tqty_a, tbon_a, tbp_a = totals_row(m, yr_a)
-tqty_b, tbon_b, tbp_b = totals_row(m, yr_b)
-
+# KPI row
 k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.metric(f"Qty {yr_a}", f"{tqty_a:,}")
-k2.metric(f"Bonus {yr_a}", f"{tbon_a:,}")
-k3.metric(f"Bonus % {yr_a}", f"{tbp_a:.1f}%")
-k4.metric(f"Qty {yr_b}", f"{tqty_b:,}", delta=f"{tqty_b - tqty_a:+,}")
-k5.metric(f"Bonus {yr_b}", f"{tbon_b:,}", delta=f"{tbon_b - tbon_a:+,}")
-k6.metric(f"Bonus % {yr_b}", f"{tbp_b:.1f}%", delta=f"{tbp_b - tbp_a:+.1f} pp")
+k1.metric(f"Qty A ({start_ts_a.strftime(DATE_FMT_DISPLAY)} → {end_ts_a.strftime(DATE_FMT_DISPLAY)})", f"{tqty_a:,}")
+k2.metric("Bonus A", f"{tbon_a:,}")
+k3.metric("Bonus % A", f"{tpct_a:.1f}%")
+k4.metric(f"Qty B ({start_ts_b.strftime(DATE_FMT_DISPLAY)} → {end_ts_b.strftime(DATE_FMT_DISPLAY)})",
+          f"{tqty_b:,}", delta=f"{tqty_b - tqty_a:+,}")
+k5.metric("Bonus B", f"{tbon_b:,}", delta=f"{tbon_b - tbon_a:+,}")
+k6.metric("Bonus % B", f"{tpct_b:.1f}%", delta=f"{tpct_b - tpct_a:+.1f} pp")
 
 st.divider()
 
-# Charts — side-by-side lines for Qty and Bonus
+# Charts — aligned by MonthIndex (1..N for each range) so lengths can differ
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("Monthly Qty Purchased")
-    dd = pd.concat([
-        m_a.assign(Year=str(yr_a)),
-        m_b.assign(Year=str(yr_b)),
+    dd_q = pd.concat([
+        m_a.assign(Range="A"),
+        m_b.assign(Range="B"),
     ], ignore_index=True)
-    fig_q = px.line(dd, x="Month", y="Qty_Purchased", color="Year",
-                    markers=True)
+    fig_q = px.line(dd_q, x="MonthIndex", y="Qty_Purchased", color="Range",
+                    markers=True,
+                    hover_data={"MonthIndex": True, "MonthStart": True})
     fig_q.update_layout(margin=dict(l=10, r=10, t=10, b=10),
                         xaxis=dict(tickmode="linear", tick0=1, dtick=1))
     st.plotly_chart(fig_q, use_container_width=True)
 
 with c2:
     st.subheader("Monthly Bonus")
-    fig_b = px.line(dd, x="Month", y="Bonus_Received", color="Year",
-                    markers=True)
+    fig_b = px.line(dd_q, x="MonthIndex", y="Bonus_Received", color="Range",
+                    markers=True,
+                    hover_data={"MonthIndex": True, "MonthStart": True})
     fig_b.update_layout(margin=dict(l=10, r=10, t=10, b=10),
                         xaxis=dict(tickmode="linear", tick0=1, dtick=1))
     st.plotly_chart(fig_b, use_container_width=True)
 
 st.subheader("Monthly Bonus %")
-dd_bp = pd.concat([
-    m_a.assign(Year=str(yr_a)),
-    m_b.assign(Year=str(yr_b)),
-], ignore_index=True)
-fig_bp = px.line(dd_bp, x="Month", y="Bonus %", color="Year", markers=True)
+dd_bp = pd.concat([m_a.assign(Range="A"), m_b.assign(Range="B")], ignore_index=True)
+fig_bp = px.line(dd_bp, x="MonthIndex", y="Bonus %", color="Range", markers=True,
+                 hover_data={"MonthIndex": True, "MonthStart": True})
 fig_bp.update_layout(margin=dict(l=10, r=10, t=10, b=10),
                      xaxis=dict(tickmode="linear", tick0=1, dtick=1))
 st.plotly_chart(fig_bp, use_container_width=True)
 
 st.divider()
 
-# Bars — annual totals
-st.subheader("Annual Totals Comparison")
-tot_df = pd.DataFrame({
-    "Year": [str(yr_a), str(yr_b)],
-    "Qty Purchased": [tqty_a, tqty_b],
-    "Bonus Received": [tbon_a, tbon_b],
-    "Bonus %": [tbp_a, tbp_b],
-})
-fig_tot_q = px.bar(tot_df, x="Year", y="Qty Purchased", text="Qty Purchased")
-fig_tot_q.update_traces(texttemplate="%{text:,}", textposition="outside")
-fig_tot_q.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-st.plotly_chart(fig_tot_q, use_container_width=True)
-
-fig_tot_b = px.bar(tot_df, x="Year", y="Bonus Received", text="Bonus Received")
-fig_tot_b.update_traces(texttemplate="%{text:,}", textposition="outside")
-fig_tot_b.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-st.plotly_chart(fig_tot_b, use_container_width=True)
-
-st.divider()
-
-# Table — month-by-month side-by-side
-st.subheader("Month-by-Month (Side-by-Side)")
+# Tables — side-by-side MonthIndex
+st.subheader("Month-by-Month (Aligned by MonthIndex)")
+max_len = max(len(m_a), len(m_b))
+a_ext = m_a.set_index("MonthIndex").reindex(range(1, max_len+1))
+b_ext = m_b.set_index("MonthIndex").reindex(range(1, max_len+1))
 
 table = pd.DataFrame({
-    "Month": range(1, 13),
-    f"Qty {yr_a}": m_a["Qty_Purchased"].astype(int),
-    f"Qty {yr_b}": m_b["Qty_Purchased"].astype(int),
-    f"Bonus {yr_a}": m_a["Bonus_Received"].astype(int),
-    f"Bonus {yr_b}": m_b["Bonus_Received"].astype(int),
-    f"Bonus % {yr_a}": (m_a["Bonus %"]).round(1),
-    f"Bonus % {yr_b}": (m_b["Bonus %"]).round(1),
-    "Δ Qty": (m_b["Qty_Purchased"] - m_a["Qty_Purchased"]).astype(int),
-    "Δ Bonus": (m_b["Bonus_Received"] - m_a["Bonus_Received"]).astype(int),
-    "Δ Bonus % (pp)": (m_b["Bonus %"] - m_a["Bonus %"]).round(1),
+    "MonthIndex": range(1, max_len+1),
+    "A: Qty": a_ext["Qty_Purchased"].fillna(0).astype(int),
+    "B: Qty": b_ext["Qty_Purchased"].fillna(0).astype(int),
+    "A: Bonus": a_ext["Bonus_Received"].fillna(0).astype(int),
+    "B: Bonus": b_ext["Bonus_Received"].fillna(0).astype(int),
+    "A: Bonus %": a_ext["Bonus %"].fillna(0).round(1),
+    "B: Bonus %": b_ext["Bonus %"].fillna(0).round(1),
+    "Δ Qty (B-A)": (b_ext["Qty_Purchased"].fillna(0) - a_ext["Qty_Purchased"].fillna(0)).astype(int),
+    "Δ Bonus (B-A)": (b_ext["Bonus_Received"].fillna(0) - a_ext["Bonus_Received"].fillna(0)).astype(int),
+    "Δ Bonus % (pp)": (b_ext["Bonus %"].fillna(0) - a_ext["Bonus %"].fillna(0)).round(1),
 })
 st.dataframe(
     table,
-    use_container_width=True,
-    hide_index=True,
+    use_container_width=True, hide_index=True,
     column_config={
-        f"Qty {yr_a}": st.column_config.NumberColumn(format="%,d"),
-        f"Qty {yr_b}": st.column_config.NumberColumn(format="%,d"),
-        f"Bonus {yr_a}": st.column_config.NumberColumn(format="%,d"),
-        f"Bonus {yr_b}": st.column_config.NumberColumn(format="%,d"),
-        f"Bonus % {yr_a}": st.column_config.NumberColumn(format="%.1f"),
-        f"Bonus % {yr_b}": st.column_config.NumberColumn(format="%.1f"),
-        "Δ Qty": st.column_config.NumberColumn(format="%,d"),
-        "Δ Bonus": st.column_config.NumberColumn(format="%,d"),
+        "A: Qty": st.column_config.NumberColumn(format="%,d"),
+        "B: Qty": st.column_config.NumberColumn(format="%,d"),
+        "A: Bonus": st.column_config.NumberColumn(format="%,d"),
+        "B: Bonus": st.column_config.NumberColumn(format="%,d"),
+        "A: Bonus %": st.column_config.NumberColumn(format="%.1f"),
+        "B: Bonus %": st.column_config.NumberColumn(format="%.1f"),
+        "Δ Qty (B-A)": st.column_config.NumberColumn(format="%,d"),
+        "Δ Bonus (B-A)": st.column_config.NumberColumn(format="%,d"),
         "Δ Bonus % (pp)": st.column_config.NumberColumn(format="+.1f"),
     }
 )
 
 st.divider()
-# Quick link back to the main dashboard (adjust if your main file name differs)
+
+# ===================== NEW: SKU Bonus % Movers =====================
+
+# Per-SKU aggregates for each range
+a_sku = sku_agg_range(tx_f, start_ts_a, end_ts_a).rename(
+    columns={"Qty": "Qty A", "Bonus": "Bonus A", "Bonus %": "Bonus % A"}
+)
+b_sku = sku_agg_range(tx_f, start_ts_b, end_ts_b).rename(
+    columns={"Qty": "Qty B", "Bonus": "Bonus B", "Bonus %": "Bonus % B"}
+)
+
+comp = a_sku.merge(b_sku, on=["Code", "Product"], how="outer").fillna(0)
+comp["Total Qty (A+B)"] = (comp["Qty A"] + comp["Qty B"]).astype(int)
+comp["Δ Bonus % (pp)"] = (comp["Bonus % B"] - comp["Bonus % A"]).round(1)
+
+# Apply minimum combined quantity to reduce noise
+comp_f = comp[comp["Total Qty (A+B)"] >= min_combined_qty].copy()
+
+# Top 25 increases and decreases
+increases = comp_f.sort_values("Δ Bonus % (pp)", ascending=False).head(25)
+decreases = comp_f.sort_values("Δ Bonus % (pp)", ascending=True).head(25)
+
+st.subheader("🔼 SKUs with Bonus % Increased (Top 25)")
+if increases.empty:
+    st.info("No SKUs meet the filter for increases.")
+else:
+    st.dataframe(
+        increases[[
+            "Code","Product",
+            "Qty A","Bonus A","Bonus % A",
+            "Qty B","Bonus B","Bonus % B",
+            "Total Qty (A+B)","Δ Bonus % (pp)"
+        ]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Qty A": st.column_config.NumberColumn(format="%,d"),
+            "Bonus A": st.column_config.NumberColumn(format="%,d"),
+            "Bonus % A": st.column_config.NumberColumn(format="%.1f"),
+            "Qty B": st.column_config.NumberColumn(format="%,d"),
+            "Bonus B": st.column_config.NumberColumn(format="%,d"),
+            "Bonus % B": st.column_config.NumberColumn(format="%.1f"),
+            "Total Qty (A+B)": st.column_config.NumberColumn(format="%,d"),
+            "Δ Bonus % (pp)": st.column_config.NumberColumn(format="+.1f"),
+        },
+    )
+
+st.subheader("🔻 SKUs with Bonus % Decreased (Top 25)")
+if decreases.empty:
+    st.info("No SKUs meet the filter for decreases.")
+else:
+    st.dataframe(
+        decreases[[
+            "Code","Product",
+            "Qty A","Bonus A","Bonus % A",
+            "Qty B","Bonus B","Bonus % B",
+            "Total Qty (A+B)","Δ Bonus % (pp)"
+        ]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Qty A": st.column_config.NumberColumn(format="%,d"),
+            "Bonus A": st.column_config.NumberColumn(format="%,d"),
+            "Bonus % A": st.column_config.NumberColumn(format="%.1f"),
+            "Qty B": st.column_config.NumberColumn(format="%,d"),
+            "Bonus B": st.column_config.NumberColumn(format="%,d"),
+            "Bonus % B": st.column_config.NumberColumn(format="%.1f"),
+            "Total Qty (A+B)": st.column_config.NumberColumn(format="%,d"),
+            "Δ Bonus % (pp)": st.column_config.NumberColumn(format="+.1f"),
+        },
+    )
+
+st.divider()
+
+# Quick link back to the main dashboard (adjust filename if needed)
 try:
     st.page_link("app.py", label="⬅️ Back to Dashboard", icon="🏠")
 except Exception:
