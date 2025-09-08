@@ -5,9 +5,8 @@ import requests
 from io import BytesIO
 import plotly.express as px
 import re
-from datetime import date, datetime, timedelta
 
-st.set_page_config(page_title="YoY (or Any Range) Compare — Purchase vs Bonus", layout="wide")
+st.set_page_config(page_title="Range Compare — Purchase vs Bonus", layout="wide")
 
 # --- Shared config (same as main)
 SHEET_ID = "1R7o4xKMeYWcYWwAOorMyYDtjg0-74FqDK0xAFKN6Iuo"
@@ -72,12 +71,12 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
 
 @st.cache_data(ttl=900)
 def load_all(prefer="mdy"):
-    # Try full workbook (needs openpyxl). If not available, fallback to first tab CSV.
+    """Load entire workbook (xlsx) or fall back to first tab CSV if openpyxl isn't available."""
     try:
         r = requests.get(XLSX_URL, timeout=60)
         r.raise_for_status()
         with BytesIO(r.content) as bio:
-            book = pd.read_excel(bio, sheet_name=None, dtype=str)
+            book = pd.read_excel(bio, sheet_name=None, dtype=str)  # needs openpyxl
         frames = []
         for sheet_name, df in book.items():
             if df is None or df.empty:
@@ -181,8 +180,6 @@ if "Date" not in tx.columns or tx["Date"].notna().sum() == 0:
     st.info("No valid dates found. This page requires a Date column.")
     st.stop()
 
-tx["Year"] = tx["Date"].dt.year
-
 # Sidebar filters (supplier/search + optional SKU)
 with st.sidebar:
     st.header("Filters")
@@ -190,7 +187,7 @@ with st.sidebar:
     supplier_options = sorted([s for s in sup_series.unique() if s])
     selected_supplier = st.selectbox("Supplier", ["All suppliers"] + supplier_options, index=0)
     q = st.text_input("Search (code or product)", "")
-    include_undated = st.checkbox("Include rows with missing Date (outside ranges)", value=False)
+    _ = st.checkbox("Include rows with missing Date (outside ranges)", value=False)  # informational
 
 # Apply base mask first
 mask = pd.Series(True, index=tx.index)
@@ -202,33 +199,63 @@ if q.strip():
         tx.get("Product", pd.Series("", index=tx.index)).astype(str).str.lower().str.contains(ql, na=False)
         | tx.get("Code", pd.Series("", index=tx.index)).astype(str).str.contains(ql, na=False)
     )
-tx_f = tx[mask & tx["Date"].notna()].copy()  # for comparison we need valid dates
+tx_f = tx[mask & tx["Date"].notna()].copy()  # comparison needs valid dates
 if tx_f.empty:
     st.info("No transactions match your supplier/search filters.")
     st.stop()
 
-# Defaults for ranges: A = previous full calendar year, B = latest full calendar year
+# ---- Compute safe defaults & render date pickers ----
 dmin = tx_f["Date"].min().normalize()
 dmax = tx_f["Date"].max().normalize()
-latest_year = int(dmax.year)
-prev_year = latest_year - 1
-default_a = (pd.Timestamp(prev_year, 1, 1), pd.Timestamp(prev_year, 12, 31))
-default_b = (pd.Timestamp(latest_year, 1, 1), pd.Timestamp(latest_year, 12, 31))
 
-# Date pickers (MM/DD/YYYY) for A & B
+latest_year = int(dmax.year)
+prev_year   = latest_year - 1
+
+def jan1(y):  return pd.Timestamp(y, 1, 1)
+def dec31(y): return pd.Timestamp(y, 12, 31)
+
+def clamp_range(start_ts: pd.Timestamp, end_ts: pd.Timestamp,
+                lo: pd.Timestamp, hi: pd.Timestamp):
+    """Clamp [start_ts, end_ts] to [lo, hi]. If empty after clamp, fallback to [lo, hi]."""
+    s = max(start_ts.normalize(), lo)
+    e = min(end_ts.normalize(), hi)
+    if s > e:
+        s, e = lo, hi
+    return s, e
+
+raw_a = (jan1(prev_year),  dec31(prev_year))
+raw_b = (jan1(latest_year), dec31(latest_year))
+
+default_a_start, default_a_end = clamp_range(raw_a[0], raw_a[1], dmin, dmax)
+default_b_start, default_b_end = clamp_range(raw_b[0], raw_b[1], dmin, dmax)
+
 colA, colB = st.columns(2)
 with colA:
     st.subheader("Range A")
-    start_a, end_a = st.date_input(
-        "Start / End (A)", value=(default_a[0].date(), default_a[1].date()),
-        min_value=dmin.date(), max_value=dmax.date(), format="MM/DD/YYYY"
+    start_a_date, end_a_date = st.date_input(
+        "Start / End (A)",
+        value=(default_a_start.date(), default_a_end.date()),
+        min_value=dmin.date(),
+        max_value=dmax.date(),
+        format="MM/DD/YYYY",
     )
 with colB:
     st.subheader("Range B")
-    start_b, end_b = st.date_input(
-        "Start / End (B)", value=(default_b[0].date(), default_b[1].date()),
-        min_value=dmin.date(), max_value=dmax.date(), format="MM/DD/YYYY"
+    start_b_date, end_b_date = st.date_input(
+        "Start / End (B)",
+        value=(default_b_start.date(), default_b_end.date()),
+        min_value=dmin.date(),
+        max_value=dmax.date(),
+        format="MM/DD/YYYY",
     )
+
+# Convert to timestamps & guard against inverted ranges
+start_ts_a, end_ts_a = pd.Timestamp(start_a_date).normalize(), pd.Timestamp(end_a_date).normalize()
+start_ts_b, end_ts_b = pd.Timestamp(start_b_date).normalize(), pd.Timestamp(end_b_date).normalize()
+if start_ts_a > end_ts_a:
+    start_ts_a, end_ts_a = end_ts_a, start_ts_a
+if start_ts_b > end_ts_b:
+    start_ts_b, end_ts_b = end_ts_b, start_ts_b
 
 # Optional SKU picker AFTER we know the slice universe
 sku_series = tx_f["Code"].astype(str) + " — " + tx_f["Product"].astype(str)
@@ -236,9 +263,8 @@ sku_list = ["(All filtered SKUs)"] + sorted(sku_series.unique().tolist())
 with st.sidebar:
     selected_sku = st.selectbox("SKU (optional)", sku_list, index=0)
 
-# (NEW) Min combined quantity filter for the increase/decrease tables
+# Min combined quantity filter for the movers tables
 with st.sidebar:
-    # use overall combined qty to size the slider sensibly
     overall_qty = int(tx_f.groupby(["Code","Product"])["Qty Purchased"].sum().max() or 0)
     slider_max = max(overall_qty, 1000)
     min_combined_qty = st.slider("Min combined Qty (A+B) for tables", 0, slider_max, 100, step=50)
@@ -255,9 +281,6 @@ if selected_sku != "(All filtered SKUs)":
         st.stop()
 
 # Build month aggregations for both ranges
-start_ts_a, end_ts_a = pd.Timestamp(start_a).normalize(), pd.Timestamp(end_a).normalize()
-start_ts_b, end_ts_b = pd.Timestamp(start_b).normalize(), pd.Timestamp(end_b).normalize()
-
 m_a = month_agg(tx_f, start_ts_a, end_ts_a)
 m_b = month_agg(tx_f, start_ts_b, end_ts_b)
 
@@ -280,13 +303,9 @@ st.divider()
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("Monthly Qty Purchased")
-    dd_q = pd.concat([
-        m_a.assign(Range="A"),
-        m_b.assign(Range="B"),
-    ], ignore_index=True)
+    dd_q = pd.concat([m_a.assign(Range="A"), m_b.assign(Range="B")], ignore_index=True)
     fig_q = px.line(dd_q, x="MonthIndex", y="Qty_Purchased", color="Range",
-                    markers=True,
-                    hover_data={"MonthIndex": True, "MonthStart": True})
+                    markers=True, hover_data={"MonthIndex": True, "MonthStart": True})
     fig_q.update_layout(margin=dict(l=10, r=10, t=10, b=10),
                         xaxis=dict(tickmode="linear", tick0=1, dtick=1))
     st.plotly_chart(fig_q, use_container_width=True)
@@ -294,8 +313,7 @@ with c1:
 with c2:
     st.subheader("Monthly Bonus")
     fig_b = px.line(dd_q, x="MonthIndex", y="Bonus_Received", color="Range",
-                    markers=True,
-                    hover_data={"MonthIndex": True, "MonthStart": True})
+                    markers=True, hover_data={"MonthIndex": True, "MonthStart": True})
     fig_b.update_layout(margin=dict(l=10, r=10, t=10, b=10),
                         xaxis=dict(tickmode="linear", tick0=1, dtick=1))
     st.plotly_chart(fig_b, use_container_width=True)
@@ -310,7 +328,7 @@ st.plotly_chart(fig_bp, use_container_width=True)
 
 st.divider()
 
-# Tables — side-by-side MonthIndex
+# Month-by-Month (aligned by MonthIndex)
 st.subheader("Month-by-Month (Aligned by MonthIndex)")
 max_len = max(len(m_a), len(m_b))
 a_ext = m_a.set_index("MonthIndex").reindex(range(1, max_len+1))
@@ -346,7 +364,7 @@ st.dataframe(
 
 st.divider()
 
-# ===================== NEW: SKU Bonus % Movers =====================
+# ===================== SKU Bonus % Movers =====================
 
 # Per-SKU aggregates for each range
 a_sku = sku_agg_range(tx_f, start_ts_a, end_ts_a).rename(
@@ -361,6 +379,8 @@ comp["Total Qty (A+B)"] = (comp["Qty A"] + comp["Qty B"]).astype(int)
 comp["Δ Bonus % (pp)"] = (comp["Bonus % B"] - comp["Bonus % A"]).round(1)
 
 # Apply minimum combined quantity to reduce noise
+# Sensible default if slider wasn't created for some reason
+min_combined_qty = int('min_combined_qty' in locals() and min_combined_qty or 100)
 comp_f = comp[comp["Total Qty (A+B)"] >= min_combined_qty].copy()
 
 # Top 25 increases and decreases
