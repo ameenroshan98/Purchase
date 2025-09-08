@@ -2,18 +2,12 @@
 import streamlit as st
 st.set_page_config(page_title="Purchase Dashboard", layout="wide")  # must be first Streamlit call
 
+# =============================
+# Authentication (version-proof)
+# =============================
 import streamlit_authenticator as stauth
-import inspect
-import pandas as pd
-import requests
-from io import BytesIO
-import plotly.express as px
-import re
 
-# =============================
-# Authentication (robust block)
-# =============================
-# Secrets TOML expected:
+# ---- Secrets format expected (in Settings → Secrets):
 # [cookie]
 # name = "purchase_dash_auth"
 # key = "your-long-random-secret"
@@ -35,7 +29,7 @@ for uname, u in st.secrets["credentials"]["usernames"].items():
         "password": str(u["password"]),
     }
 
-# Read cookie settings and coerce types
+# Read cookie settings & coerce types
 cookie_cfg = st.secrets.get("cookie", {})
 cookie_name = str(cookie_cfg.get("name", "purchase_dash_auth"))
 cookie_key = str(cookie_cfg.get("key", "change-this-secret"))
@@ -44,20 +38,52 @@ try:
 except Exception:
     cookie_expiry_days = 14
 
-# Detect constructor signature for your installed streamlit-authenticator
-init_sig = inspect.signature(stauth.Authenticate.__init__)
-kw = {}
-if "cookie_expiry_days" in init_sig.parameters:
-    kw["cookie_expiry_days"] = cookie_expiry_days
-elif "expiry_days" in init_sig.parameters:  # older versions
-    kw["expiry_days"] = cookie_expiry_days
-# else: let library default
 
-_authenticator = stauth.Authenticate(
-    credentials=_creds,
-    cookie_name=cookie_name,
-    key=cookie_key,
-    **kw,
+def build_authenticator(creds, cookie_name, cookie_key, expiry_days):
+    """
+    Try all supported Authenticate signatures across popular versions:
+    1) credentials=..., cookie_name=..., key=..., cookie_expiry_days=...
+    2) credentials=..., cookie_name=..., key=..., expiry_days=...
+    3) (LEGACY positional) names, usernames, passwords, cookie_name, key, expiry_days
+    """
+    # 1) Newer style (most common)
+    try:
+        return stauth.Authenticate(
+            credentials=creds,
+            cookie_name=cookie_name,
+            key=cookie_key,
+            cookie_expiry_days=expiry_days,
+        )
+    except TypeError:
+        pass
+
+    # 2) Some versions use 'expiry_days' instead of 'cookie_expiry_days'
+    try:
+        return stauth.Authenticate(
+            credentials=creds,
+            cookie_name=cookie_name,
+            key=cookie_key,
+            expiry_days=expiry_days,
+        )
+    except TypeError:
+        pass
+
+    # 3) Very old legacy positional API
+    names = [creds["usernames"][u]["name"] for u in creds["usernames"]]
+    usernames = list(creds["usernames"].keys())
+    passwords = [creds["usernames"][u]["password"] for u in creds["usernames"]]
+    return stauth.Authenticate(
+        names,
+        usernames,
+        passwords,
+        cookie_name,
+        cookie_key,
+        expiry_days,
+    )
+
+
+_authenticator = build_authenticator(
+    _creds, cookie_name, cookie_key, cookie_expiry_days
 )
 
 name, auth_status, username = _authenticator.login("Login", "main")
@@ -72,9 +98,16 @@ elif auth_status is None:
 _authenticator.logout("Logout", "sidebar")
 st.sidebar.caption(f"Signed in as **{name}**")
 
-# -------------------------------------------------
+# =============================
+# App proper
+# =============================
+import pandas as pd
+import requests
+from io import BytesIO
+import plotly.express as px
+import re
+
 # Quick link to the comparison page
-# -------------------------------------------------
 try:
     st.page_link("pages/Compare_Yearly_Patterns.py", label="📅 Compare Ranges (Purchase vs Bonus)")
 except Exception:
