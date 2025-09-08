@@ -347,19 +347,19 @@ b_sku = sku_agg_range(tx_f, start_ts_b, end_ts_b).rename(
 
 comp = a_sku.merge(b_sku, on=["Code", "Product"], how="outer").fillna(0)
 comp["Total Qty (A+B)"] = (comp["Qty A"] + comp["Qty B"]).astype(int)
-comp["Δ Bonus % (pp)"] = (comp["Bonus % B"] - comp["Bonus % A"]).round(1)
+comp["Δ Bonus % (pp)"] = (comp["Bonus % B"] - comp["Bonus % A"]).astype(float).round(1)
 
 # Apply minimum combined quantity to reduce noise
 min_combined_qty = int('min_combined_qty' in locals() and min_combined_qty or 100)
 comp_f = comp[comp["Total Qty (A+B)"] >= min_combined_qty].copy()
 
-# Top 25 increases and decreases
-increases = comp_f.sort_values("Δ Bonus % (pp)", ascending=False).head(25)
-decreases = comp_f.sort_values("Δ Bonus % (pp)", ascending=True).head(25)
+# Separate by sign to avoid identical lists when deltas ~ 0
+increases = comp_f[comp_f["Δ Bonus % (pp)"] > 0].sort_values("Δ Bonus % (pp)", ascending=False).head(25)
+decreases = comp_f[comp_f["Δ Bonus % (pp)"] < 0].sort_values("Δ Bonus % (pp)", ascending=True).head(25)
 
 st.subheader("🔼 SKUs with Bonus % Increased (Top 25)")
 if increases.empty:
-    st.info("No SKUs meet the filter for increases.")
+    st.info("No SKUs show an increase in Bonus % under the current filters.")
 else:
     st.dataframe(
         increases[[
@@ -377,13 +377,13 @@ else:
             "Bonus B": st.column_config.NumberColumn(format="%,d"),
             "Bonus % B": st.column_config.NumberColumn(format="%.1f"),
             "Total Qty (A+B)": st.column_config.NumberColumn(format="%,d"),
-            "Δ Bonus % (pp)": st.column_config.NumberColumn(format="+.1f"),
+            "Δ Bonus % (pp)": st.column_config.NumberColumn(format="%.1f"),
         },
     )
 
 st.subheader("🔻 SKUs with Bonus % Decreased (Top 25)")
 if decreases.empty:
-    st.info("No SKUs meet the filter for decreases.")
+    st.info("No SKUs show a decrease in Bonus % under the current filters.")
 else:
     st.dataframe(
         decreases[[
@@ -401,7 +401,7 @@ else:
             "Bonus B": st.column_config.NumberColumn(format="%,d"),
             "Bonus % B": st.column_config.NumberColumn(format="%.1f"),
             "Total Qty (A+B)": st.column_config.NumberColumn(format="%,d"),
-            "Δ Bonus % (pp)": st.column_config.NumberColumn(format="+.1f"),
+            "Δ Bonus % (pp)": st.column_config.NumberColumn(format="%.1f"),
         },
     )
 
