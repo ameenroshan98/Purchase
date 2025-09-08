@@ -8,13 +8,16 @@ import re
 
 st.set_page_config(page_title="Range Compare — Purchase vs Bonus", layout="wide")
 
-# --- Shared config (same as main)
+# --- Config
 SHEET_ID = "1R7o4xKMeYWcYWwAOorMyYDtjg0-74FqDK0xAFKN6Iuo"
 XLSX_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
 CSV_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=0"
 DATE_FMT_DISPLAY = "%m/%d/%Y"
 
-# ---------------- Helpers (copied from main for self-containment) ----------------
+# Fixed month order for x-axes
+MONTHS_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+# ---------------- Helpers ----------------
 def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
     s_raw = raw_col.astype(str)
     s = (s_raw
@@ -39,7 +42,6 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
         iso_try = pd.to_datetime(val, errors="coerce")
         if pd.notna(iso_try):
             return iso_try.normalize()
-
         parts = re.split(r"[\/]", val)
         if len(parts) != 3:
             return pd.NaT
@@ -47,10 +49,8 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
             a, b, c = [int(p) for p in parts]
         except Exception:
             return pd.NaT
-
         if c < 100:
             c += 2000 if c < 70 else 1900
-
         if a > 12 and b <= 12:   # D/M/Y
             m, d, y = b, a, c
         elif b > 12 and a <= 12: # M/D/Y
@@ -59,7 +59,6 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
             return pd.NaT
         else:
             m, d, y = (a, b, c) if prefer.lower() != "dmy" else (b, a, c)
-
         try:
             return pd.Timestamp(year=y, month=m, day=d).normalize()
         except Exception:
@@ -132,7 +131,7 @@ def load_all(prefer="mdy"):
 
 # --------- Range utilities ----------
 def month_agg(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
-    """Filter df by [start_ts, end_ts], group monthly, return MonthIndex + MonthLabel ('Jan', 'Feb', …)."""
+    """Filter df by [start_ts, end_ts], group monthly; include MonthLabel ('Jan'..'Dec')."""
     msk = df["Date"].between(start_ts, end_ts, inclusive="both")
     d = df.loc[msk].copy()
     if d.empty:
@@ -145,8 +144,7 @@ def month_agg(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp) ->
     g = (d.groupby("MonthStart", as_index=False)
            .agg(Qty_Purchased=("Qty Purchased", "sum"),
                 Bonus_Received=("Bonus", "sum")))
-    g["Bonus %"] = (g["Bonus_Received"] / g["Qty_Purchased"] * 100)\
-                    .replace([float("inf"), -float("inf")], 0).fillna(0.0)
+    g["Bonus %"] = (g["Bonus_Received"] / g["Qty_Purchased"] * 100).replace([float("inf"), -float("inf")], 0).fillna(0.0)
     g = g.sort_values("MonthStart").reset_index(drop=True)
     g["MonthIndex"] = g.index + 1
     g["MonthLabel"] = g["MonthStart"].dt.strftime("%b")
@@ -290,11 +288,6 @@ m_b = month_agg(tx_f, start_ts_b, end_ts_b)
 tqty_a, tbon_a, tpct_a = totals(m_a)
 tqty_b, tbon_b, tpct_b = totals(m_b)
 
-# Prepare a unified category order for MonthLabel across both ranges
-labels_order = pd.concat([m_a[["MonthIndex","MonthLabel"]],
-                          m_b[["MonthIndex","MonthLabel"]]], ignore_index=True)\
-                  .sort_values("MonthIndex")["MonthLabel"].drop_duplicates().tolist()
-
 # KPI row
 k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric(f"Qty A ({start_ts_a.strftime(DATE_FMT_DISPLAY)} → {end_ts_a.strftime(DATE_FMT_DISPLAY)})", f"{tqty_a:,}")
@@ -307,34 +300,37 @@ k6.metric("Bonus % B", f"{tpct_b:.1f}%", delta=f"{tpct_b - tpct_a:+.1f} pp")
 
 st.divider()
 
-# Charts — x = Month name (not numbers)
+# Charts — x = Month name in fixed calendar order
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("Monthly Qty Purchased")
     dd_q = pd.concat([m_a.assign(Range="A"), m_b.assign(Range="B")], ignore_index=True)
-    fig_q = px.line(dd_q, x="MonthLabel", y="Qty_Purchased", color="Range",
-                    markers=True, hover_data={"MonthLabel": True, "MonthStart": True})
-    fig_q.update_layout(margin=dict(l=10, r=10, t=10, b=10),
-                        xaxis_title="Month",
-                        xaxis={'categoryorder': 'array', 'categoryarray': labels_order})
+    fig_q = px.line(
+        dd_q, x="MonthLabel", y="Qty_Purchased", color="Range",
+        markers=True, hover_data={"MonthLabel": True, "MonthStart": True},
+        category_orders={"MonthLabel": MONTHS_ABBR}
+    )
+    fig_q.update_layout(margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Month")
     st.plotly_chart(fig_q, use_container_width=True)
 
 with c2:
     st.subheader("Monthly Bonus")
-    fig_b = px.line(dd_q, x="MonthLabel", y="Bonus_Received", color="Range",
-                    markers=True, hover_data={"MonthLabel": True, "MonthStart": True})
-    fig_b.update_layout(margin=dict(l=10, r=10, t=10, b=10),
-                        xaxis_title="Month",
-                        xaxis={'categoryorder': 'array', 'categoryarray': labels_order})
+    fig_b = px.line(
+        dd_q, x="MonthLabel", y="Bonus_Received", color="Range",
+        markers=True, hover_data={"MonthLabel": True, "MonthStart": True},
+        category_orders={"MonthLabel": MONTHS_ABBR}
+    )
+    fig_b.update_layout(margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Month")
     st.plotly_chart(fig_b, use_container_width=True)
 
 st.subheader("Monthly Bonus %")
 dd_bp = pd.concat([m_a.assign(Range="A"), m_b.assign(Range="B")], ignore_index=True)
-fig_bp = px.line(dd_bp, x="MonthLabel", y="Bonus %", color="Range", markers=True,
-                 hover_data={"MonthLabel": True, "MonthStart": True})
-fig_bp.update_layout(margin=dict(l=10, r=10, t=10, b=10),
-                     xaxis_title="Month",
-                     xaxis={'categoryorder': 'array', 'categoryarray': labels_order})
+fig_bp = px.line(
+    dd_bp, x="MonthLabel", y="Bonus %", color="Range", markers=True,
+    hover_data={"MonthLabel": True, "MonthStart": True},
+    category_orders={"MonthLabel": MONTHS_ABBR}
+)
+fig_bp.update_layout(margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Month")
 st.plotly_chart(fig_bp, use_container_width=True)
 
 st.divider()
