@@ -328,43 +328,13 @@ st.plotly_chart(fig_bp, use_container_width=True)
 
 st.divider()
 
-# Month-by-Month (aligned by MonthIndex)
-st.subheader("Month-by-Month (Aligned by MonthIndex)")
-max_len = max(len(m_a), len(m_b))
-a_ext = m_a.set_index("MonthIndex").reindex(range(1, max_len+1))
-b_ext = m_b.set_index("MonthIndex").reindex(range(1, max_len+1))
-
-table = pd.DataFrame({
-    "MonthIndex": range(1, max_len+1),
-    "A: Qty": a_ext["Qty_Purchased"].fillna(0).astype(int),
-    "B: Qty": b_ext["Qty_Purchased"].fillna(0).astype(int),
-    "A: Bonus": a_ext["Bonus_Received"].fillna(0).astype(int),
-    "B: Bonus": b_ext["Bonus_Received"].fillna(0).astype(int),
-    "A: Bonus %": a_ext["Bonus %"].fillna(0).round(1),
-    "B: Bonus %": b_ext["Bonus %"].fillna(0).round(1),
-    "Δ Qty (B-A)": (b_ext["Qty_Purchased"].fillna(0) - a_ext["Qty_Purchased"].fillna(0)).astype(int),
-    "Δ Bonus (B-A)": (b_ext["Bonus_Received"].fillna(0) - a_ext["Bonus_Received"].fillna(0)).astype(int),
-    "Δ Bonus % (pp)": (b_ext["Bonus %"].fillna(0) - a_ext["Bonus %"].fillna(0)).round(1),
-})
-st.dataframe(
-    table,
-    use_container_width=True, hide_index=True,
-    column_config={
-        "A: Qty": st.column_config.NumberColumn(format="%,d"),
-        "B: Qty": st.column_config.NumberColumn(format="%,d"),
-        "A: Bonus": st.column_config.NumberColumn(format="%,d"),
-        "B: Bonus": st.column_config.NumberColumn(format="%,d"),
-        "A: Bonus %": st.column_config.NumberColumn(format="%.1f"),
-        "B: Bonus %": st.column_config.NumberColumn(format="%.1f"),
-        "Δ Qty (B-A)": st.column_config.NumberColumn(format="%,d"),
-        "Δ Bonus (B-A)": st.column_config.NumberColumn(format="%,d"),
-        "Δ Bonus % (pp)": st.column_config.NumberColumn(format="+.1f"),
-    }
-)
+# (after fig_bp …)
+st.plotly_chart(fig_bp, use_container_width=True)
 
 st.divider()
 
 # ===================== SKU Bonus % Movers =====================
+# … (rest of your movers code unchanged)
 
 # Per-SKU aggregates for each range
 a_sku = sku_agg_range(tx_f, start_ts_a, end_ts_a).rename(
