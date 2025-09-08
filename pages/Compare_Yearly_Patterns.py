@@ -362,7 +362,7 @@ comp["Δ Bonus % (pp)"] = (comp["Bonus % B"] - comp["Bonus % A"]).astype(float).
 min_combined_qty = int('min_combined_qty' in locals() and min_combined_qty or 100)
 comp_f = comp[comp["Total Qty (A+B)"] >= min_combined_qty].copy()
 
-# Separate by sign to avoid identical lists when deltas ~ 0
+# Separate by sign
 increases = comp_f[comp_f["Δ Bonus % (pp)"] > 0].sort_values("Δ Bonus % (pp)", ascending=False).head(25)
 decreases = comp_f[comp_f["Δ Bonus % (pp)"] < 0].sort_values("Δ Bonus % (pp)", ascending=True).head(25)
 
@@ -379,13 +379,13 @@ else:
         ]],
         use_container_width=True, hide_index=True,
         column_config={
-            "Qty A": st.column_config.NumberColumn(format="%,d"),
-            "Bonus A": st.column_config.NumberColumn(format="%,d"),
+            "Qty A": st.column_config.NumberColumn(format="%d"),
+            "Bonus A": st.column_config.NumberColumn(format="%d"),
             "Bonus % A": st.column_config.NumberColumn(format="%.1f"),
-            "Qty B": st.column_config.NumberColumn(format="%,d"),
-            "Bonus B": st.column_config.NumberColumn(format="%,d"),
+            "Qty B": st.column_config.NumberColumn(format="%d"),
+            "Bonus B": st.column_config.NumberColumn(format="%d"),
             "Bonus % B": st.column_config.NumberColumn(format="%.1f"),
-            "Total Qty (A+B)": st.column_config.NumberColumn(format="%,d"),
+            "Total Qty (A+B)": st.column_config.NumberColumn(format="%d"),
             "Δ Bonus % (pp)": st.column_config.NumberColumn(format="%.1f"),
         },
     )
@@ -403,13 +403,13 @@ else:
         ]],
         use_container_width=True, hide_index=True,
         column_config={
-            "Qty A": st.column_config.NumberColumn(format="%,d"),
-            "Bonus A": st.column_config.NumberColumn(format="%,d"),
+            "Qty A": st.column_config.NumberColumn(format="%d"),
+            "Bonus A": st.column_config.NumberColumn(format="%d"),
             "Bonus % A": st.column_config.NumberColumn(format="%.1f"),
-            "Qty B": st.column_config.NumberColumn(format="%,d"),
-            "Bonus B": st.column_config.NumberColumn(format="%,d"),
+            "Qty B": st.column_config.NumberColumn(format="%d"),
+            "Bonus B": st.column_config.NumberColumn(format="%d"),
             "Bonus % B": st.column_config.NumberColumn(format="%.1f"),
-            "Total Qty (A+B)": st.column_config.NumberColumn(format="%,d"),
+            "Total Qty (A+B)": st.column_config.NumberColumn(format="%d"),
             "Δ Bonus % (pp)": st.column_config.NumberColumn(format="%.1f"),
         },
     )
