@@ -10,6 +10,7 @@ import requests
 from io import BytesIO
 import plotly.express as px
 import re
+import time
 
 # Quick link to the comparison page
 try:
@@ -119,17 +120,22 @@ def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
 # -------------------------------------------------
 @st.cache_data(ttl=900)
 def load_transactions(prefer="mdy"):
-    # Try XLSX (entire workbook)
+    # Try XLSX (entire workbook) with simple retry
     try:
-        r = requests.get(XLSX_URL, timeout=60)
-        r.raise_for_status()
-        with BytesIO(r.content) as bio:
-            book = pd.read_excel(bio, sheet_name=None, dtype=str)
+        for attempt in range(3):
+            r = requests.get(XLSX_URL, timeout=60)
+            if r.ok and r.headers.get("Content-Type", "").lower().startswith(("application/vnd.openxml", "application/octet-stream")):
+                with BytesIO(r.content) as bio:
+                    book = pd.read_excel(bio, sheet_name=None, dtype=str)
+                break
+            time.sleep(1.2 * (attempt + 1))
+        else:
+            raise RuntimeError("XLSX fetch failed")
         frames = []
         for sheet_name, df in book.items():
             if df is None or df.empty:
                 continue
-            df = df.dropna(how="all")
+            df = df.dropna(haw="all") if hasattr(df, "haw") else df.dropna(how="all")
             df.columns = pd.Index(df.columns).astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
             df["__sheet__"] = sheet_name
             frames.append(df)
@@ -183,9 +189,19 @@ def load_transactions(prefer="mdy"):
 # -------------------------------------------------
 # UI & Analytics (WITH DATE FILTER)
 # -------------------------------------------------
-tx = load_transactions(prefer="mdy")
-
 st.title("📊 Purchase Dashboard")
+
+# Controls: ambiguity preference + refresh
+with st.sidebar:
+    st.markdown("### Data refresh & locale")
+    colr1, colr2 = st.columns([1,1])
+    prefer_order = colr1.radio("Ambiguous dates", ["mdy","dmy"], index=0, horizontal=True,
+                               help="Used only when both parts ≤ 12 (e.g., 03/04/25).")
+    if colr2.button("🔄 Force refresh", use_container_width=True):
+        load_transactions.clear()
+        st.experimental_rerun()
+
+tx = load_transactions(prefer=prefer_order)
 
 if tx.empty or "Code" not in tx.columns or "Product" not in tx.columns:
     st.warning("No data found or required columns missing (Code/Product).")
@@ -421,7 +437,7 @@ st.markdown(
 
 st.divider()
 
-# Charts
+# Charts — keep only the bar chart
 chart_df = agg.sort_values("Qty Purchased", ascending=False)
 if 'top_n' in locals() and top_n is not None:
     chart_df = chart_df.head(top_n)
@@ -463,43 +479,6 @@ if not chart_df.empty:
     st.plotly_chart(fig_bar, use_container_width=True)
 else:
     st.info("No rows for bar chart.")
-
-colA, colB = st.columns(2)
-with colA:
-    st.subheader("Purchase Share — Top Products (Treemap)")
-    if not chart_df.empty:
-        fig_tree = px.treemap(
-            chart_df,
-            path=[px.Constant("Top-N" if ('top_n' in locals() and top_n is not None) else "All"), "Label"],
-            values="Qty Purchased",
-            hover_data={"Qty Purchased":":,", "Bonus Received":":,"}
-        )
-        fig_tree.update_traces(root_color="lightgrey")
-        fig_tree.update_layout(margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_tree, use_container_width=True)
-    else:
-        st.info("No rows for treemap.")
-
-with colB:
-    st.subheader("Bonus % vs Purchased (Bubble)")
-    bub = agg.copy()
-    bub["Label"] = bub.apply(lambda r: short_label(r["Code"], r["Product"], 30), axis=1)
-    if not bub.empty:
-        fig_bub = px.scatter(
-            bub, x="Qty Purchased", y="Bonus %",
-            size="Qty Purchased", color="Status",
-            hover_name="Label", height=420
-        )
-        # ---- Dynamic Y max: never exceed 500%, add ~15% headroom if small
-        max_pct = float(pd.to_numeric(bub["Bonus %"], errors="coerce").max() or 0)
-        y_upper = min(500.0, max(10.0, max_pct * 1.15))
-        fig_bub.update_yaxes(range=[0, y_upper])
-        fig_bub.add_hline(y=10, line_dash="dot", annotation_text="10% ref")
-        fig_bub.update_layout(margin=dict(l=10, r=10, t=30, b=10),
-                              xaxis_title="Qty Purchased", yaxis_title="Bonus %")
-        st.plotly_chart(fig_bub, use_container_width=True)
-    else:
-        st.info("No rows for bubble chart.")
 
 st.divider()
 
