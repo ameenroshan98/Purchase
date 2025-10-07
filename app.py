@@ -1,6 +1,6 @@
 # app.py
 import streamlit as st
-st.set_page_config(page_title="Purchase Dashboard", layout="wide")  # must be first Streamlit call
+st.set_page_config(page_title="Purchase Dashboard", layout="wide")  # must be first
 
 # =============================
 # App proper (no authentication)
@@ -31,7 +31,8 @@ DATE_FMT_DISPLAY = "%m/%d/%Y"  # mm/dd/yyyy
 # -------------------------------------------------
 def short_label(code, name, n=42):
     name = str(name)
-    return f"{code} — {name[:n]}…" if len(name) > n else f"{code} — {name}"
+    s = f"{code} — {name}"
+    return s if len(s) <= n + len(str(code)) + 3 else f"{code} — {name[:n]}…"
 
 def avg_gap_days(s: pd.Series) -> float:
     """Average days between purchases for a product (unique dates only)."""
@@ -47,161 +48,154 @@ def avg_gap_days(s: pd.Series) -> float:
     diffs = dates.diff().dt.days.dropna()
     return float(diffs.mean())
 
-def parse_dates_smart(raw_col: pd.Series, prefer: str = "mdy"):
-    """
-    Smart parser with per-row detection + serials + ISO.
-    prefer: "mdy" (default) or "dmy" used only when ambiguous (both parts <= 12).
-    Returns (parsed_Timestamps, original_strings)
-    """
-    s_raw = raw_col.astype(str)
+# -------------------------------------------------
+# Fast loader (CSV one-tab) or full workbook, with pruning and compact dtypes
+# -------------------------------------------------
+@st.cache_data(ttl=1800, max_entries=4)
+def load_transactions(prefer="mdy", fast_mode=True):
+    # Columns used downstream
+    usecols = ["Supplier Name", "Code", "Product", "Date", "Qty Purchased", "Bonus", "Bonus %"]
 
-    # Clean NBSP, trim, unify separators
-    s = (s_raw
-         .str.replace("\u00A0", " ", regex=False)
-         .str.strip()
-         .str.replace(".", "/", regex=False))
-
-    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
-
-    # 1) Excel/Sheets serial numbers
-    serial = pd.to_numeric(s, errors="coerce")
-    serial_mask = serial.notna()
-    if serial_mask.any():
-        out.loc[serial_mask] = pd.to_datetime(
-            serial.loc[serial_mask], unit="D", origin="1899-12-30", errors="coerce"
+    def _standardize_headers(df: pd.DataFrame) -> pd.DataFrame:
+        df.columns = (
+            pd.Index(df.columns)
+            .astype(str)
+            .str.replace("\u00A0", " ", regex=False)
+            .str.strip()
         )
+        # Tolerate variants
+        rename_map = {
+            "Supplier Name": "Supplier Name",
+            "Code": "Code",
+            "Product": "Product",
+            "Date": "Date",
+            "Qty Purchased": "Qty Purchased",
+            "quantity purchased": "Qty Purchased",
+            "qty purchased": "Qty Purchased",
+            "qty": "Qty Purchased",
+            "Bonus": "Bonus",
+            "Bonus %": "Bonus %",
+            "Bonus%": "Bonus %",
+        }
+        df = df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
+        return df
 
-    # 2) Strings with separators
-    mask = ~serial_mask
-    s2 = s[mask].str.replace("-", "/", regex=False)
+    def _fast_dates(series: pd.Series, prefer: str) -> pd.Series:
+        # Vectorized date parsing with serial support
+        s = series.astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+        s = s.str.replace(".", "/", regex=False).str.replace("-", "/", regex=False)
+        # Excel serials
+        serial = pd.to_numeric(s, errors="coerce")
+        out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+        serial_mask = serial.notna()
+        if serial_mask.any():
+            out.loc[serial_mask] = pd.to_datetime(
+                serial.loc[serial_mask], unit="D", origin="1899-12-30", errors="coerce"
+            )
+        # Vector parse the rest (prefer mdy/dmy on ambiguous)
+        rest = ~serial_mask
+        if rest.any():
+            dayfirst = (prefer.lower() == "dmy")
+            out.loc[rest] = pd.to_datetime(
+                s.loc[rest], errors="coerce", dayfirst=dayfirst, infer_datetime_format=True
+            )
+        return out.dt.normalize()
 
-    def parse_one(val: str):
-        if not val:
-            return pd.NaT
-        # Try ISO first
-        iso_try = pd.to_datetime(val, errors="coerce")
-        if pd.notna(iso_try):
-            return iso_try.normalize()
+    def _postprocess(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            empty = pd.DataFrame(columns=usecols)
+            for c in usecols:
+                empty[c] = pd.NA
+            return empty
 
-        parts = re.split(r"[\/]", val)
-        if len(parts) != 3:
-            return pd.NaT
+        df = _standardize_headers(df)
+        # Ensure needed cols exist
+        for c in usecols:
+            if c not in df.columns:
+                df[c] = pd.NA
+        df = df[usecols]
+
+        # Dates (fast path)
+        df["Date"] = _fast_dates(df["Date"], prefer)
+
+        # Numerics
+        for c in ["Qty Purchased", "Bonus", "Bonus %"]:
+            df[c] = df[c].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+        df["Qty Purchased"] = pd.to_numeric(df["Qty Purchased"], errors="coerce").fillna(0).astype("int32")
+        df["Bonus"]         = pd.to_numeric(df["Bonus"], errors="coerce").fillna(0).astype("int32")
+        df["Bonus %"]       = pd.to_numeric(df["Bonus %"], errors="coerce").fillna(0.0).astype("float32")
+
+        # Categories for faster groupby/filter
+        for c in ["Supplier Name", "Code", "Product"]:
+            df[c] = df[c].astype("category")
+
+        return df
+
+    if fast_mode:
+        # FAST PATH: CSV single tab (small payload)
         try:
-            a, b, c = [int(p) for p in parts]
+            df = pd.read_csv(CSV_URL, dtype=str)
+            df["__sheet__"] = f"gid_{GID}"
+            return _postprocess(df)
         except Exception:
-            return pd.NaT
+            pass  # fall through to XLSX if CSV fails
 
-        if c < 100:
-            c += 2000 if c < 70 else 1900
-
-        if a > 12 and b <= 12:   # D/M/Y
-            m, d, y = b, a, c
-        elif b > 12 and a <= 12: # M/D/Y
-            m, d, y = a, b, c
-        elif a > 12 and b > 12:
-            return pd.NaT
-        else:
-            if prefer.lower() == "dmy":
-                m, d, y = b, a, c
-            else:
-                m, d, y = a, b, c
-
-        try:
-            return pd.Timestamp(year=y, month=m, day=d).normalize()
-        except Exception:
-            return pd.NaT
-
-    parsed = s2.apply(parse_one)
-    out.loc[mask] = parsed.values
-    return out, s_raw
-
-# -------------------------------------------------
-# Load ALL data from the Google Sheet (all tabs), fallback to CSV
-# -------------------------------------------------
-@st.cache_data(ttl=900)
-def load_transactions(prefer="mdy"):
-    # Try XLSX (entire workbook) with simple retry
+    # FULL PATH: Entire workbook
     try:
         for attempt in range(3):
             r = requests.get(XLSX_URL, timeout=60)
-            if r.ok and r.headers.get("Content-Type", "").lower().startswith(("application/vnd.openxml", "application/octet-stream")):
+            if r.ok:
                 with BytesIO(r.content) as bio:
-                    book = pd.read_excel(bio, sheet_name=None, dtype=str)
+                    book = pd.read_excel(bio, sheet_name=None, dtype=str, engine="openpyxl")
                 break
             time.sleep(1.2 * (attempt + 1))
         else:
             raise RuntimeError("XLSX fetch failed")
+
         frames = []
-        for sheet_name, df in book.items():
+        for sheet_name, df in (book or {}).items():
             if df is None or df.empty:
                 continue
-            df = df.dropna(haw="all") if hasattr(df, "haw") else df.dropna(how="all")
-            df.columns = pd.Index(df.columns).astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
+            df = df.dropna(how="all")
             df["__sheet__"] = sheet_name
             frames.append(df)
-        df_all = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        big = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return _postprocess(big)
     except Exception:
-        # Fallback: CSV of one tab
-        df_all = pd.read_csv(CSV_URL, dtype=str).fillna("")
-        df_all.columns = pd.Index(df_all.columns).astype(str).str.replace("\u00A0", " ", regex=False).str.strip()
-        df_all["__sheet__"] = f"gid_{GID}"
-
-    if df_all.empty:
-        return df_all
-
-    # Standardize headers (tolerate variants)
-    rename_map = {
-        "Supplier Name": "Supplier Name",
-        "Code": "Code",
-        "Product": "Product",
-        "Date": "Date",
-        "Qty Purchased": "Qty Purchased",
-        "Bonus": "Bonus",
-        "Bonus %": "Bonus %"
-    }
-    for c in list(df_all.columns):
-        lc = c.lower().strip()
-        if lc in ["qty purchased", "quantity purchased", "qty"]:
-            rename_map[c] = "Qty Purchased"
-    df_all = df_all.rename(columns=rename_map)
-
-    # Parse Date (smart; prefers MDY)
-    if "Date" in df_all.columns:
-        parsed, date_raw = parse_dates_smart(df_all["Date"], prefer=prefer)
-        df_all["_Date_raw"] = date_raw
-        df_all["Date"] = parsed
-
-    # Numerics
-    for c in ["Qty Purchased", "Bonus"]:
-        if c in df_all.columns:
-            df_all[c] = pd.to_numeric(df_all[c].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
-
-    if "Bonus %" in df_all.columns:
-        df_all["Bonus %"] = (
-            df_all["Bonus %"].astype(str)
-            .str.replace("%", "", regex=False)
-            .str.replace(",", "", regex=False)
-        )
-        df_all["Bonus %"] = pd.to_numeric(df_all["Bonus %"], errors="coerce").fillna(0.0)
-
-    return df_all
+        # Final fallback to CSV if XLSX fails
+        df = pd.read_csv(CSV_URL, dtype=str)
+        df["__sheet__"] = f"gid_{GID}"
+        return _postprocess(df)
 
 # -------------------------------------------------
-# UI & Analytics (WITH DATE FILTER)
+# UI & Analytics
 # -------------------------------------------------
 st.title("📊 Purchase Dashboard")
 
-# Controls: ambiguity preference + refresh
+# Controls: data locale + refresh + performance
 with st.sidebar:
     st.markdown("### Data refresh & locale")
-    colr1, colr2 = st.columns([1,1])
-    prefer_order = colr1.radio("Ambiguous dates", ["mdy","dmy"], index=0, horizontal=True,
-                               help="Used only when both parts ≤ 12 (e.g., 03/04/25).")
-    if colr2.button("🔄 Force refresh", use_container_width=True):
+    c1, c2 = st.columns([1, 1])
+    prefer_order = c1.radio(
+        "Ambiguous dates",
+        ["mdy", "dmy"],
+        index=0,
+        horizontal=True,
+        help="Used only when both parts ≤ 12 (e.g., 03/04/25)."
+    )
+    if c2.button("🔄 Force refresh", use_container_width=True):
         load_transactions.clear()
         st.experimental_rerun()
 
-tx = load_transactions(prefer=prefer_order)
+with st.sidebar:
+    st.markdown("### Performance")
+    FAST_MODE = st.toggle(
+        "⚡ Fast mode (CSV, one tab)",
+        value=True,
+        help="Loads the CSV of the primary tab only. Disable to load the entire workbook (slower)."
+    )
+
+tx = load_transactions(prefer=prefer_order, fast_mode=FAST_MODE)
 
 if tx.empty or "Code" not in tx.columns or "Product" not in tx.columns:
     st.warning("No data found or required columns missing (Code/Product).")
@@ -223,13 +217,15 @@ with st.expander("📊 Load diagnostics"):
         "Rows with missing/unparseable Date": int(tx["Date"].isna().sum()) if "Date" in tx else "n/a",
         "Distinct suppliers": int(tx["Supplier Name"].nunique() if "Supplier Name" in tx else 0),
         "Sheets combined": int(tx["__sheet__"].nunique() if "__sheet__" in tx else 1),
+        "Fast mode": FAST_MODE,
     })
+
 if "Date" in tx.columns and tx["Date"].isna().sum() > 0:
-    bad = tx.loc[tx["Date"].isna(), "_Date_raw"].value_counts().head(10)
     with st.expander("⚠️ Examples of unparseable dates"):
+        bad = tx.loc[tx["Date"].isna(), "Date"].astype(str).value_counts().head(10)
         st.write(bad)
 
-# Sidebar filters (now includes DATE RANGE)
+# Sidebar filters (with DATE RANGE)
 with st.sidebar:
     st.header("Filters")
     sup_series = tx.get("Supplier Name", pd.Series("", index=tx.index)).astype(str).str.strip()
@@ -270,18 +266,17 @@ with st.sidebar:
         )
     preview_max = 0
     if mask_preview.any() and "Qty Purchased" in tx.columns:
-        prev_agg = (tx.loc[mask_preview]
-                      .groupby(["Code","Product"], as_index=False)["Qty Purchased"]
-                      .sum())
+        prev_agg = (
+            tx.loc[mask_preview]
+              .groupby(["Code", "Product"], as_index=False)["Qty Purchased"]
+              .sum()
+        )
         if not prev_agg.empty:
             preview_max = int(prev_agg["Qty Purchased"].max())
     min_qty = st.slider("Min Qty Purchased (product total)", 0, max(preview_max, 0), 0, step=100)
 
     scope = st.radio("Chart scope", ["Top-N", "All"], horizontal=True)
-    if scope == "Top-N":
-        top_n = st.slider("Top-N for charts", 5, 100, 15)
-    else:
-        top_n = None
+    top_n = st.slider("Top-N for charts", 5, 100, 15) if scope == "Top-N" else None
 
 # Build transaction-level mask (supplier + search + DATE)
 mask_tx = pd.Series(True, index=tx.index)
@@ -293,6 +288,7 @@ if q.strip():
         tx.get("Product", pd.Series("", index=tx.index)).astype(str).str.lower().str.contains(ql, na=False)
         | tx.get("Code", pd.Series("", index=tx.index)).astype(str).str.contains(ql, na=False)
     )
+
 # Apply date range (if present)
 if "Date" in tx.columns and pd.notna(min_date) and pd.notna(max_date) and start_d and end_d:
     s_ts, e_ts = pd.Timestamp(start_d).normalize(), pd.Timestamp(end_d).normalize()
@@ -316,7 +312,7 @@ agg_base = (
             Times_Bonus=("Bonus", lambda s: (s > 0).sum()),
             Avg_Purchase_Qty=("Qty Purchased", "mean"),
             Avg_Bonus_Qty=("Bonus", "mean"),
-            Last_Purchase=("Date", "max") if "Date" in tx_f.columns else ("Product","count")
+            Last_Purchase=("Date", "max") if "Date" in tx_f.columns else ("Product", "count")
         )
         .rename(columns={
             "Qty_Purchased": "Qty Purchased",
@@ -356,8 +352,15 @@ var_df = (
 )
 
 # Merge & compute effective Bonus %
-agg = agg_base.merge(gap_series, on=["Code","Product"], how="left").merge(var_df, on=["Code","Product"], how="left")
-agg["Bonus %"] = (agg["Bonus Received"] / agg["Qty Purchased"] * 100).replace([pd.NA, pd.NaT, float("inf")], 0).fillna(0).round(1)
+agg = (
+    agg_base
+    .merge(gap_series, on=["Code","Product"], how="left")
+    .merge(var_df, on=["Code","Product"], how="left")
+)
+agg["Bonus %"] = (
+    agg["Bonus Received"].replace(0, 0) /
+    agg["Qty Purchased"].replace(0, pd.NA) * 100
+).fillna(0).astype(float).round(1)
 agg["Avg Days Between"] = agg["Avg Days Between"].round(1)
 
 # Recency vs latest date found (of filtered set)
@@ -382,10 +385,10 @@ if agg.empty:
     st.stop()
 
 # 3-status classification (Core / Promo-timed / Review)
-BONUS_PROMO = 8.0      # %
-BPR_PROMO   = 0.50     # share of orders with bonus
-STALE_DAYS_MIN = 90
-FACTOR_GAP     = 1.5
+BONUS_PROMO     = 8.0   # %
+BPR_PROMO       = 0.50  # share of orders with bonus
+STALE_DAYS_MIN  = 90
+FACTOR_GAP      = 1.5
 
 def classify_simple(r):
     ebp = r["Bonus %"]
@@ -416,7 +419,7 @@ if status_choice != "(All)":
 
 # KPIs
 total_purchased = int(agg["Qty Purchased"].sum())
-total_bonus = int(agg["Bonus Received"].sum())
+total_bonus     = int(agg["Bonus Received"].sum())
 overall_bonus_rate = (total_bonus / total_purchased * 100) if total_purchased > 0 else 0
 
 c1, c2, c3, c4 = st.columns(4)
@@ -425,7 +428,7 @@ c2.metric("Total Purchased", f"{total_purchased:,}")
 c3.metric("Total Bonus", f"{total_bonus:,}")
 c4.metric("Overall Bonus %", f"{overall_bonus_rate:.1f}%")
 
-# ---- Status definitions (always visible, compact)
+# ---- Status definitions (compact)
 st.markdown(
     """
 **Status definitions:**  
@@ -437,18 +440,18 @@ st.markdown(
 
 st.divider()
 
-# Charts — keep only the bar chart
-chart_df = agg.sort_values("Qty Purchased", ascending=False)
-if 'top_n' in locals() and top_n is not None:
-    chart_df = chart_df.head(top_n)
-chart_df["Label"] = chart_df.apply(lambda r: short_label(r["Code"], r["Product"]), axis=1)
+# Charts — keep only the bar chart (fast)
+agg["Label"] = (agg["Code"].astype(str) + " — " + agg["Product"].astype(str))
+chart_df = agg.nlargest(top_n or len(agg), "Qty Purchased")[["Label", "Qty Purchased", "Bonus Received"]].copy()
 
 top_qty   = chart_df["Qty Purchased"].sum()
 top_bonus = chart_df["Bonus Received"].sum()
 cov_qty   = (top_qty / total_purchased * 100) if total_purchased else 0
 cov_bonus = (top_bonus / total_bonus * 100) if total_bonus else 0
-st.caption(f"Bars cover {top_qty:,.0f} purchased ({cov_qty:.1f}% of total) "
-           f"and {top_bonus:,.0f} bonus ({cov_bonus:.1f}% of total).")
+st.caption(
+    f"Bars cover {top_qty:,.0f} purchased ({cov_qty:.1f}% of total) "
+    f"and {top_bonus:,.0f} bonus ({cov_bonus:.1f}% of total)."
+)
 
 st.subheader("Purchased vs Bonus — Top Products")
 if not chart_df.empty:
@@ -466,8 +469,8 @@ if not chart_df.empty:
         legend_title="", bargap=0.15,
         margin=dict(l=10, r=60, t=30, b=10)
     )
-    fig_bar.update_traces(hovertemplate="%{y}<br>%{legendgroup}: %{x:,.0f}",
-                          cliponaxis=False)
+    fig_bar.update_traces(hovertemplate="%{y}<br>%{legendgroup}: %{x:,.0f}", cliponaxis=False)
+    # Out-of-bar labels for bonus series only (cheaper rendering)
     for tr in fig_bar.data:
         if tr.name == "Bonus Received":
             tr.text = [f"{v:,.0f}" for v in tr.x]
@@ -522,34 +525,36 @@ with right:
 
 st.divider()
 
-# Detailed Products table
-st.subheader(f"Detailed Products ({len(agg):,})")
-cols = [
-    "Status","Code","Product","Qty Purchased","Bonus Received",
-    "Times Purchased","Times Bonus","Avg Purchase Qty","Avg Bonus Qty",
-    "Avg Days Between","Bonus %","Bonus Presence Rate","Bonus Variability (pp)","Status Note"
-]
-present = [c for c in cols if c in agg.columns]
-st.dataframe(
-    agg[present].sort_values("Qty Purchased", ascending=False),
-    use_container_width=True, hide_index=True,
-    column_config={
-        "Qty Purchased": st.column_config.NumberColumn(format="%d"),
-        "Bonus Received": st.column_config.NumberColumn(format="%d"),
-        "Times Purchased": st.column_config.NumberColumn(format="%d"),
-        "Times Bonus": st.column_config.NumberColumn(format="%d"),
-        "Avg Purchase Qty": st.column_config.NumberColumn(format="%.1f"),
-        "Avg Bonus Qty": st.column_config.NumberColumn(format="%.1f"),
-        "Avg Days Between": st.column_config.NumberColumn(format="%.1f"),
-        "Bonus Presence Rate": st.column_config.NumberColumn(format="%.2f"),
-        "Bonus Variability (pp)": st.column_config.NumberColumn(format="%.1f"),
-        "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
-    },
-)
+# Detailed Products table (lazy)
+show_detailed = st.toggle("Show detailed products table", value=False)
+if show_detailed:
+    st.subheader(f"Detailed Products ({len(agg):,})")
+    cols = [
+        "Status","Code","Product","Qty Purchased","Bonus Received",
+        "Times Purchased","Times Bonus","Avg Purchase Qty","Avg Bonus Qty",
+        "Avg Days Between","Bonus %","Bonus Presence Rate","Bonus Variability (pp)","Status Note"
+    ]
+    present = [c for c in cols if c in agg.columns]
+    st.dataframe(
+        agg[present].sort_values("Qty Purchased", ascending=False),
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Qty Purchased": st.column_config.NumberColumn(format="%d"),
+            "Bonus Received": st.column_config.NumberColumn(format="%d"),
+            "Times Purchased": st.column_config.NumberColumn(format="%d"),
+            "Times Bonus": st.column_config.NumberColumn(format="%d"),
+            "Avg Purchase Qty": st.column_config.NumberColumn(format="%.1f"),
+            "Avg Bonus Qty": st.column_config.NumberColumn(format="%.1f"),
+            "Avg Days Between": st.column_config.NumberColumn(format="%.1f"),
+            "Bonus Presence Rate": st.column_config.NumberColumn(format="%.2f"),
+            "Bonus Variability (pp)": st.column_config.NumberColumn(format="%.1f"),
+            "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
+        },
+    )
 
 st.divider()
 
-# 🔎 SKU Drill-down (entire dataset; respects current filters)
+# 🔎 SKU Drill-down (respects current filters)
 st.subheader("🔎 SKU Drill-down")
 
 agg_sorted = agg.sort_values(["Qty Purchased", "Product"], ascending=[False, True]).copy()
@@ -566,9 +571,11 @@ if selected_sku != "(Choose a product)":
     if "Bonus %" in hist.columns:
         hist["Bonus % (tx)"] = pd.to_numeric(hist["Bonus %"], errors="coerce").fillna(0).round(1)
     else:
-        hist["Bonus % (tx)"] = ((pd.to_numeric(hist["Bonus"], errors="coerce") /
-                                 pd.to_numeric(hist["Qty Purchased"], errors="coerce"))
-                                .replace([float("inf"), -float("inf")], 0) * 100).fillna(0).round(1)
+        hist["Bonus % (tx)"] = (
+            (pd.to_numeric(hist["Bonus"], errors="coerce") /
+             pd.to_numeric(hist["Qty Purchased"], errors="coerce"))
+            .replace([float("inf"), -float("inf")], 0) * 100
+        ).fillna(0).round(1)
 
     if "Date" in hist.columns:
         hist["_sort_date"] = hist["Date"]
@@ -603,8 +610,8 @@ if selected_sku != "(Choose a product)":
         },
     )
 
-# Raw transactions (filtered table)
-with st.expander("🧾 View all filtered transactions"):
+# Raw transactions (filtered table) — lazy inside expander
+with st.expander("🧾 View all filtered transactions (lazy)"):
     show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %","__sheet__"]
     show_cols = [c for c in show_cols if c in tx_f.columns or c == "__sheet__"]
     tx_show = tx_f.copy()
