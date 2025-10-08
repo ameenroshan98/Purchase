@@ -224,6 +224,18 @@ with st.sidebar:
         index=0
     )
 
+    generic_series = tx.get("Generic Name", pd.Series("", index=tx.index)).astype(str).str.strip()
+    generic_options = sorted([g for g in generic_series.unique() if g])
+    if generic_options:
+        selected_generic = st.selectbox(
+            "Generic Name",
+            options=["All generics"] + generic_options,
+            index=0
+        )
+    else:
+        st.selectbox("Generic Name", ["No generic names"], index=0, disabled=True)
+        selected_generic = "All generics"
+
     q = st.text_input("Search (code or product)", "")
 
     # Date range filter (if we have valid dates)
@@ -246,6 +258,8 @@ with st.sidebar:
     mask_preview = pd.Series(True, index=tx.index)
     if selected_supplier != "All suppliers":
         mask_preview &= (sup_series == selected_supplier)
+    if selected_generic != "All generics":
+        mask_preview &= (generic_series == selected_generic)
     if q.strip():
         ql = q.strip().lower()
         mask_preview &= (
@@ -267,10 +281,14 @@ with st.sidebar:
     else:
         top_n = None
 
+    st.info("Selections above update every tab instantly. Combine filters to focus on the exact products you need.")
+
 # Build transaction-level mask (supplier + search + DATE)
 mask_tx = pd.Series(True, index=tx.index)
 if selected_supplier != "All suppliers":
     mask_tx &= (sup_series == selected_supplier)
+if selected_generic != "All generics":
+    mask_tx &= (generic_series == selected_generic)
 if q.strip():
     ql = q.strip().lower()
     mask_tx &= (
@@ -398,120 +416,70 @@ with st.sidebar:
 if status_choice != "(All)":
     agg = agg[agg["Status"] == status_choice]
 
-# KPIs
+# Totals for overview
 total_purchased = int(agg["Qty Purchased"].sum())
 total_bonus = int(agg["Bonus Received"].sum())
 overall_bonus_rate = (total_bonus / total_purchased * 100) if total_purchased > 0 else 0
+focus_limit = top_n if ("top_n" in locals() and top_n is not None) else min(len(agg), 25)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Products (after filters)", f"{len(agg):,}")
-c2.metric("Total Purchased", f"{total_purchased:,}")
-c3.metric("Total Bonus", f"{total_bonus:,}")
-c4.metric("Overall Bonus %", f"{overall_bonus_rate:.1f}%")
+st.header("Overview")
+summary_left, summary_right = st.columns([2, 1])
+with summary_left:
+    st.markdown(
+        "\n".join([
+            "Here is a quick look at the products that match your filters.",
+            f"- **Products in view:** {len(agg):,}",
+            f"- **Purchased quantity:** {total_purchased:,}",
+            f"- **Bonus received:** {total_bonus:,}",
+            f"- **Overall bonus rate:** {overall_bonus_rate:,.1f}%",
+        ])
+    )
+    st.caption("Apply filters on the left to focus on specific suppliers, generics, or SKUs.")
+    st.markdown(
+        "**Status guide**\n"
+        "- 🟢 **Core** — Stable demand; buy steadily and negotiate base price.\n"
+        "- 🟠 **Promo-timed** — Buy during bonus windows; avoid outside promos.\n"
+        "- 🔴 **Review** — Dormant/anomalous; verify demand, data, or supplier terms."
+    )
 
-# ---- Status definitions (always visible, compact)
-st.markdown(
-    """
-**Status definitions:**  
-- 🟢 **Core** — Stable demand; buy steadily and negotiate base price.  
-- 🟠 **Promo-timed** — Buy during bonus windows; avoid outside promos.  
-- 🔴 **Review** — Dormant/anomalous; verify demand, data, or supplier terms.
-"""
-)
+with summary_right:
+    status_counts = agg["Status"].value_counts().rename_axis("Status").reset_index(name="Products")
+    if not status_counts.empty:
+        fig_status = px.bar(
+            status_counts,
+            x="Products",
+            y="Status",
+            orientation="h",
+            color="Status",
+            text="Products",
+            color_discrete_map={
+                "🟢 Core": "#2ca02c",
+                "🟠 Promo-timed": "#ff7f0e",
+                "🔴 Review": "#d62728",
+            },
+        )
+        fig_status.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            xaxis_title="Products",
+            yaxis_title="Status",
+            showlegend=False,
+        )
+        st.plotly_chart(fig_status, use_container_width=True)
+    else:
+        st.info("No products remain after filters.")
 
 st.divider()
 
-# Charts
-chart_df = agg.sort_values("Qty Purchased", ascending=False)
-if 'top_n' in locals() and top_n is not None:
-    chart_df = chart_df.head(top_n)
-chart_df["Label"] = chart_df.apply(lambda r: short_label(r["Code"], r["Product"]), axis=1)
-
-top_qty   = chart_df["Qty Purchased"].sum()
-top_bonus = chart_df["Bonus Received"].sum()
-cov_qty   = (top_qty / total_purchased * 100) if total_purchased else 0
-cov_bonus = (top_bonus / total_bonus * 100) if total_bonus else 0
-st.caption(f"Bars cover {top_qty:,.0f} purchased ({cov_qty:.1f}% of total) "
-           f"and {top_bonus:,.0f} bonus ({cov_bonus:.1f}% of total).")
-
-st.subheader("Purchased vs Bonus — Top Products")
-if not chart_df.empty:
-    m = chart_df.melt(
-        id_vars=["Label"],
-        value_vars=["Qty Purchased", "Bonus Received"],
-        var_name="Metric", value_name="Value"
-    )
-    fig_bar = px.bar(
-        m, y="Label", x="Value", color="Metric",
-        orientation="h", height=max(420, 30 * len(chart_df))
-    )
-    fig_bar.update_layout(
-        yaxis=dict(categoryorder="total ascending", automargin=True),
-        legend_title="", bargap=0.15,
-        margin=dict(l=10, r=60, t=30, b=10)
-    )
-    fig_bar.update_traces(hovertemplate="%{y}<br>%{legendgroup}: %{x:,.0f}",
-                          cliponaxis=False)
-    for tr in fig_bar.data:
-        if tr.name == "Bonus Received":
-            tr.text = [f"{v:,.0f}" for v in tr.x]
-            tr.textposition = "outside"
-            tr.texttemplate = "%{text}"
-            tr.textfont = dict(size=12)
-        else:
-            tr.text = None
-    st.plotly_chart(fig_bar, use_container_width=True)
+st.subheader("Focus products")
+if focus_limit < len(agg):
+    st.caption(f"Showing top {focus_limit} products by the selected sort criteria. Switch scope to 'All' to review everything.")
 else:
-    st.info("No rows for bar chart.")
-
-colA, colB = st.columns(2)
-with colA:
-    st.subheader("Purchase Share — Top Products (Treemap)")
-    if not chart_df.empty:
-        fig_tree = px.treemap(
-            chart_df,
-            path=[px.Constant("Top-N" if ('top_n' in locals() and top_n is not None) else "All"), "Label"],
-            values="Qty Purchased",
-            hover_data={"Qty Purchased":":,", "Bonus Received":":,"}
-        )
-        fig_tree.update_traces(root_color="lightgrey")
-        fig_tree.update_layout(margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig_tree, use_container_width=True)
-    else:
-        st.info("No rows for treemap.")
-
-with colB:
-    st.subheader("Bonus % vs Purchased (Bubble)")
-    bub = agg.copy()
-    bub["Label"] = bub.apply(lambda r: short_label(r["Code"], r["Product"], 30), axis=1)
-    if not bub.empty:
-        fig_bub = px.scatter(
-            bub, x="Qty Purchased", y="Bonus %",
-            size="Qty Purchased", color="Status",
-            hover_name="Label", height=420
-        )
-        # ---- Dynamic Y max: never exceed 500%, add ~15% headroom if small
-        max_pct = float(pd.to_numeric(bub["Bonus %"], errors="coerce").max() or 0)
-        y_upper = min(500.0, max(10.0, max_pct * 1.15))
-        fig_bub.update_yaxes(range=[0, y_upper])
-        fig_bub.add_hline(y=10, line_dash="dot", annotation_text="10% ref")
-        fig_bub.update_layout(margin=dict(l=10, r=10, t=30, b=10),
-                              xaxis_title="Qty Purchased", yaxis_title="Bonus %")
-        st.plotly_chart(fig_bub, use_container_width=True)
-    else:
-        st.info("No rows for bubble chart.")
-
-st.divider()
-
-# Highlights
-st.subheader("Highlights")
-left, right = st.columns(2)
-
-with left:
-    st.markdown("**Top by Volume (Qty Purchased)**")
-    t1 = agg.sort_values("Qty Purchased", ascending=False).head(10)[
-        ["Status", "Code", "Product", "Qty Purchased", "Bonus Received",
-         "Times Purchased", "Avg Days Between", "Bonus %", "Status Note"]
+    st.caption("Showing all products in the filtered set.")
+focus_left, focus_right = st.columns(2)
+with focus_left:
+    st.markdown("**Largest Purchases**")
+    t1 = agg.sort_values(["Qty Purchased", "Bonus Received"], ascending=[False, False]).head(focus_limit)[
+        ["Status", "Code", "Product", "Qty Purchased", "Bonus Received", "Bonus %", "Status Note"]
     ]
     st.dataframe(
         t1,
@@ -519,16 +487,15 @@ with left:
         column_config={
             "Qty Purchased": st.column_config.NumberColumn(format="%d"),
             "Bonus Received": st.column_config.NumberColumn(format="%d"),
-            "Avg Days Between": st.column_config.NumberColumn(format="%.1f"),
             "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
         },
     )
 
-with right:
-    st.markdown("**Top by Bonus % (min 100 units)**")
-    t2 = agg[agg["Qty Purchased"] >= 100].sort_values("Bonus %", ascending=False).head(10)[
+with focus_right:
+    st.markdown("**Most Frequent Bonus Presence**")
+    t2 = agg.sort_values(["Bonus Presence Rate", "Qty Purchased"], ascending=[False, False]).head(focus_limit)[
         ["Status", "Code", "Product", "Qty Purchased", "Bonus Received",
-         "Times Purchased", "Avg Days Between", "Bonus %", "Status Note"]
+         "Times Purchased", "Bonus Presence Rate", "Bonus %", "Status Note"]
     ]
     st.dataframe(
         t2,
@@ -536,15 +503,14 @@ with right:
         column_config={
             "Qty Purchased": st.column_config.NumberColumn(format="%d"),
             "Bonus Received": st.column_config.NumberColumn(format="%d"),
-            "Avg Days Between": st.column_config.NumberColumn(format="%.1f"),
+            "Bonus Presence Rate": st.column_config.NumberColumn(format="%.2f"),
             "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
         },
     )
 
 st.divider()
 
-# Detailed Products table
-st.subheader(f"Detailed Products ({len(agg):,})")
+st.subheader(f"Detailed products ({len(agg):,})")
 cols = [
     "Status","Code","Product","Qty Purchased","Bonus Received",
     "Times Purchased","Times Bonus","Avg Purchase Qty","Avg Bonus Qty",
@@ -568,10 +534,38 @@ st.dataframe(
     },
 )
 
+with st.expander("🧾 View all filtered transactions"):
+    show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %","__sheet__"]
+    show_cols = [c for c in show_cols if c in tx_f.columns or c == "__sheet__"]
+    tx_show = tx_f.copy()
+    if "__sheet__" not in tx_show.columns:
+        tx_show["__sheet__"] = "sheet"
+    tx_show = tx_show[show_cols]
+    if "Date" in tx_show.columns:
+        tx_show["_sort_date"] = tx_show["Date"]
+        tx_show["Date"] = tx_show["Date"].dt.strftime(DATE_FMT_DISPLAY)
+        tx_show = tx_show.sort_values(["__sheet__", "Product", "_sort_date"]).drop(columns=["_sort_date"])
+    st.dataframe(
+        tx_show,
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Qty Purchased": st.column_config.NumberColumn(format="%d"),
+            "Bonus": st.column_config.NumberColumn(format="%d"),
+            "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
+        },
+    )
+
+csv_cols = [
+    "Status","Code","Product","Qty Purchased","Bonus Received",
+    "Times Purchased","Times Bonus","Avg Purchase Qty","Avg Bonus Qty",
+    "Avg Days Between","Bonus %","Bonus Presence Rate","Bonus Variability (pp)","Status Note"
+]
+csv_agg = agg[[c for c in csv_cols if c in agg.columns]].to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download product summary (CSV)", csv_agg, "product_summary.csv", "text/csv")
+
 st.divider()
 
-# 🔎 SKU Drill-down (entire dataset; respects current filters)
-st.subheader("🔎 SKU Drill-down")
+st.subheader("🔎 SKU drill-down")
 
 agg_sorted = agg.sort_values(["Qty Purchased", "Product"], ascending=[False, True]).copy()
 agg_sorted["SKU"] = agg_sorted["Code"].astype(str) + " — " + agg_sorted["Product"].astype(str)
@@ -623,34 +617,3 @@ if selected_sku != "(Choose a product)":
             "Bonus % (tx)": st.column_config.ProgressColumn("Bonus % (tx)", format="%.1f%%", min_value=0, max_value=100),
         },
     )
-
-# Raw transactions (filtered table)
-with st.expander("🧾 View all filtered transactions"):
-    show_cols = ["Supplier Name","Code","Product","Date","Qty Purchased","Bonus","Bonus %","__sheet__"]
-    show_cols = [c for c in show_cols if c in tx_f.columns or c == "__sheet__"]
-    tx_show = tx_f.copy()
-    if "__sheet__" not in tx_show.columns:
-        tx_show["__sheet__"] = "sheet"
-    tx_show = tx_show[show_cols]
-    if "Date" in tx_show.columns:
-        tx_show["_sort_date"] = tx_show["Date"]
-        tx_show["Date"] = tx_show["Date"].dt.strftime(DATE_FMT_DISPLAY)
-        tx_show = tx_show.sort_values(["__sheet__", "Product", "_sort_date"]).drop(columns=["_sort_date"])
-    st.dataframe(
-        tx_show,
-        use_container_width=True, hide_index=True,
-        column_config={
-            "Qty Purchased": st.column_config.NumberColumn(format="%d"),
-            "Bonus": st.column_config.NumberColumn(format="%d"),
-            "Bonus %": st.column_config.ProgressColumn("Bonus %", format="%.1f%%", min_value=0, max_value=100),
-        },
-    )
-
-# Download summary
-csv_cols = [
-    "Status","Code","Product","Qty Purchased","Bonus Received",
-    "Times Purchased","Times Bonus","Avg Purchase Qty","Avg Bonus Qty",
-    "Avg Days Between","Bonus %","Bonus Presence Rate","Bonus Variability (pp)","Status Note"
-]
-csv_agg = agg[[c for c in csv_cols if c in agg.columns]].to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Download product summary (CSV)", csv_agg, "product_summary.csv", "text/csv")
