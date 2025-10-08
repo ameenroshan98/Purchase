@@ -8,7 +8,6 @@ st.set_page_config(page_title="Purchase Dashboard", layout="wide")  # must be fi
 import pandas as pd
 import requests
 from io import BytesIO
-import plotly.express as px
 import re
 import time
 
@@ -29,11 +28,6 @@ DATE_FMT_DISPLAY = "%m/%d/%Y"  # mm/dd/yyyy
 # -------------------------------------------------
 # Helpers
 # -------------------------------------------------
-def short_label(code, name, n=42):
-    name = str(name)
-    s = f"{code} — {name}"
-    return s if len(s) <= n + len(str(code)) + 3 else f"{code} — {name[:n]}…"
-
 def avg_gap_days(s: pd.Series) -> float:
     """Average days between purchases for a product (unique dates only)."""
     dates = (
@@ -51,7 +45,7 @@ def avg_gap_days(s: pd.Series) -> float:
 # -------------------------------------------------
 # Fast loader (CSV one-tab) or full workbook, with pruning and compact dtypes
 # -------------------------------------------------
-@st.cache_data(ttl=1800, max_entries=4)
+@st.cache_data(ttl=1800, max_entries=4, show_spinner=False)
 def load_transactions(prefer="mdy", fast_mode=True):
     # Columns used downstream
     usecols = ["Supplier Name", "Code", "Product", "Date", "Qty Purchased", "Bonus", "Bonus %"]
@@ -77,8 +71,7 @@ def load_transactions(prefer="mdy", fast_mode=True):
             "Bonus %": "Bonus %",
             "Bonus%": "Bonus %",
         }
-        df = df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
-        return df
+        return df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
 
     def _fast_dates(series: pd.Series, prefer: str) -> pd.Series:
         # Vectorized date parsing with serial support
@@ -109,7 +102,7 @@ def load_transactions(prefer="mdy", fast_mode=True):
             return empty
 
         df = _standardize_headers(df)
-        # Ensure needed cols exist
+        # Ensure needed cols exist & order
         for c in usecols:
             if c not in df.columns:
                 df[c] = pd.NA
@@ -120,7 +113,12 @@ def load_transactions(prefer="mdy", fast_mode=True):
 
         # Numerics
         for c in ["Qty Purchased", "Bonus", "Bonus %"]:
-            df[c] = df[c].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+            df[c] = (
+                df[c].astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.replace("%", "", regex=False)
+                    .str.strip()
+            )
         df["Qty Purchased"] = pd.to_numeric(df["Qty Purchased"], errors="coerce").fillna(0).astype("int32")
         df["Bonus"]         = pd.to_numeric(df["Bonus"], errors="coerce").fillna(0).astype("int32")
         df["Bonus %"]       = pd.to_numeric(df["Bonus %"], errors="coerce").fillna(0.0).astype("float32")
@@ -140,15 +138,15 @@ def load_transactions(prefer="mdy", fast_mode=True):
         except Exception:
             pass  # fall through to XLSX if CSV fails
 
-    # FULL PATH: Entire workbook
+    # FULL PATH: Entire workbook (rare)
     try:
-        for attempt in range(3):
-            r = requests.get(XLSX_URL, timeout=60)
+        for attempt in range(2):
+            r = requests.get(XLSX_URL, timeout=45)
             if r.ok:
                 with BytesIO(r.content) as bio:
                     book = pd.read_excel(bio, sheet_name=None, dtype=str, engine="openpyxl")
                 break
-            time.sleep(1.2 * (attempt + 1))
+            time.sleep(0.8 * (attempt + 1))
         else:
             raise RuntimeError("XLSX fetch failed")
 
@@ -193,6 +191,16 @@ with st.sidebar:
         "⚡ Fast mode (CSV, one tab)",
         value=True,
         help="Loads the CSV of the primary tab only. Disable to load the entire workbook (slower)."
+    )
+    COMPUTE_ADVANCED = st.toggle(
+        "Compute advanced metrics (Recency, Avg Days Between, Variability)",
+        value=False,  # default OFF for speed
+        help="Disable to speed up large datasets."
+    )
+    SHOW_CHARTS = st.toggle(
+        "Show charts (Plotly)",
+        value=False,  # default OFF (faster & you asked to remove charts)
+        help="Enable to render bar & drill-down charts."
     )
 
 tx = load_transactions(prefer=prefer_order, fast_mode=FAST_MODE)
@@ -264,15 +272,7 @@ with st.sidebar:
             tx.get("Product", pd.Series("", index=tx.index)).astype(str).str.lower().str.contains(ql, na=False)
             | tx.get("Code", pd.Series("", index=tx.index)).astype(str).str.contains(ql, na=False)
         )
-    preview_max = 0
-    if mask_preview.any() and "Qty Purchased" in tx.columns:
-        prev_agg = (
-            tx.loc[mask_preview]
-              .groupby(["Code", "Product"], as_index=False)["Qty Purchased"]
-              .sum()
-        )
-        if not prev_agg.empty:
-            preview_max = int(prev_agg["Qty Purchased"].max())
+    preview_max = int(tx.loc[mask_preview, "Qty Purchased"].groupby([tx["Code"], tx["Product"]]).sum().max() or 0) if "Qty Purchased" in tx.columns else 0
     min_qty = st.slider("Min Qty Purchased (product total)", 0, max(preview_max, 0), 0, step=100)
 
     scope = st.radio("Chart scope", ["Top-N", "All"], horizontal=True)
@@ -325,31 +325,36 @@ agg_base = (
         })
 )
 
-# Avg Days Between (uses only valid dates)
-if "Date" in tx_f.columns:
-    gap_series = (
-        tx_f.groupby(["Code", "Product"])["Date"]
-            .apply(avg_gap_days)
-            .reset_index(name="Avg Days Between")
+# Advanced metrics (optional for speed)
+if COMPUTE_ADVANCED:
+    # Avg Days Between (uses only valid dates)
+    if "Date" in tx_f.columns:
+        gap_series = (
+            tx_f.groupby(["Code", "Product"])["Date"]
+                .apply(avg_gap_days)
+                .reset_index(name="Avg Days Between")
+        )
+    else:
+        gap_series = pd.DataFrame({"Code": [], "Product": [], "Avg Days Between": []})
+
+    # Per-transaction bonus % variability (std dev)
+    tx_tmp = tx_f.copy()
+    if "Bonus %" in tx_tmp.columns:
+        tx_tmp["bonus_pct_tx"] = pd.to_numeric(tx_tmp["Bonus %"], errors="coerce")
+    else:
+        tx_tmp["bonus_pct_tx"] = (
+            (pd.to_numeric(tx_tmp["Bonus"], errors="coerce") /
+             pd.to_numeric(tx_tmp["Qty Purchased"], errors="coerce"))
+            .replace([float("inf"), -float("inf")], 0) * 100
+        )
+
+    var_df = (
+        tx_tmp.groupby(["Code","Product"])["bonus_pct_tx"]
+              .std(ddof=0).fillna(0).reset_index(name="Bonus Variability (pp)")
     )
 else:
-    gap_series = pd.DataFrame({"Code": [], "Product": [], "Avg Days Between": []})
-
-# Per-transaction bonus % variability (std dev)
-tx_tmp = tx_f.copy()
-if "Bonus %" in tx_tmp.columns:
-    tx_tmp["bonus_pct_tx"] = pd.to_numeric(tx_tmp["Bonus %"], errors="coerce")
-else:
-    tx_tmp["bonus_pct_tx"] = (
-        (pd.to_numeric(tx_tmp["Bonus"], errors="coerce") /
-         pd.to_numeric(tx_tmp["Qty Purchased"], errors="coerce"))
-        .replace([float("inf"), -float("inf")], 0) * 100
-    )
-
-var_df = (
-    tx_tmp.groupby(["Code","Product"])["bonus_pct_tx"]
-          .std(ddof=0).fillna(0).reset_index(name="Bonus Variability (pp)")
-)
+    gap_series = pd.DataFrame({"Code": agg_base["Code"], "Product": agg_base["Product"], "Avg Days Between": pd.NA})
+    var_df   = pd.DataFrame({"Code": agg_base["Code"], "Product": agg_base["Product"], "Bonus Variability (pp)": 0})
 
 # Merge & compute effective Bonus %
 agg = (
@@ -361,10 +366,11 @@ agg["Bonus %"] = (
     agg["Bonus Received"].replace(0, 0) /
     agg["Qty Purchased"].replace(0, pd.NA) * 100
 ).fillna(0).astype(float).round(1)
-agg["Avg Days Between"] = agg["Avg Days Between"].round(1)
+if COMPUTE_ADVANCED:
+    agg["Avg Days Between"] = pd.to_numeric(agg["Avg Days Between"], errors="coerce").round(1)
 
 # Recency vs latest date found (of filtered set)
-if "Date" in tx_f.columns and pd.notna(tx_f["Date"]).any():
+if COMPUTE_ADVANCED and "Date" in tx_f.columns and pd.notna(tx_f["Date"]).any():
     end_norm = tx_f["Date"].dropna().max().normalize()
     agg["Recency Days"] = (end_norm - agg["Last Purchase Date"]).dt.days
 else:
@@ -403,6 +409,7 @@ def classify_simple(r):
         return "Promo-timed"
     return "Core"
 
+# If advanced off, keep 'gap' and 'var' benign so classify still works.
 agg["StatusKey"] = agg.apply(classify_simple, axis=1)
 STATUS_COPY = {
     "Core": ("🟢 Core", "Stable demand; buy steadily and negotiate base price."),
@@ -440,50 +447,50 @@ st.markdown(
 
 st.divider()
 
-# Charts — keep only the bar chart (fast)
-agg["Label"] = (agg["Code"].astype(str) + " — " + agg["Product"].astype(str))
-chart_df = agg.nlargest(top_n or len(agg), "Qty Purchased")[["Label", "Qty Purchased", "Bonus Received"]].copy()
+# Charts — optional & lazy import
+if SHOW_CHARTS:
+    import plotly.express as px  # lazy to keep import cost zero when off
 
-top_qty   = chart_df["Qty Purchased"].sum()
-top_bonus = chart_df["Bonus Received"].sum()
-cov_qty   = (top_qty / total_purchased * 100) if total_purchased else 0
-cov_bonus = (top_bonus / total_bonus * 100) if total_bonus else 0
-st.caption(
-    f"Bars cover {top_qty:,.0f} purchased ({cov_qty:.1f}% of total) "
-    f"and {top_bonus:,.0f} bonus ({cov_bonus:.1f}% of total)."
-)
+    agg["Label"] = (agg["Code"].astype(str) + " — " + agg["Product"].astype(str))
+    chart_df = agg.nlargest(top_n or len(agg), "Qty Purchased")[["Label", "Qty Purchased", "Bonus Received"]].copy()
 
-st.subheader("Purchased vs Bonus — Top Products")
-if not chart_df.empty:
-    m = chart_df.melt(
-        id_vars=["Label"],
-        value_vars=["Qty Purchased", "Bonus Received"],
-        var_name="Metric", value_name="Value"
+    top_qty   = chart_df["Qty Purchased"].sum()
+    top_bonus = chart_df["Bonus Received"].sum()
+    cov_qty   = (top_qty / total_purchased * 100) if total_purchased else 0
+    cov_bonus = (top_bonus / total_bonus * 100) if total_bonus else 0
+    st.caption(
+        f"Bars cover {top_qty:,.0f} purchased ({cov_qty:.1f}% of total) "
+        f"and {top_bonus:,.0f} bonus ({cov_bonus:.1f}% of total)."
     )
-    fig_bar = px.bar(
-        m, y="Label", x="Value", color="Metric",
-        orientation="h", height=max(420, 30 * len(chart_df))
-    )
-    fig_bar.update_layout(
-        yaxis=dict(categoryorder="total ascending", automargin=True),
-        legend_title="", bargap=0.15,
-        margin=dict(l=10, r=60, t=30, b=10)
-    )
-    fig_bar.update_traces(hovertemplate="%{y}<br>%{legendgroup}: %{x:,.0f}", cliponaxis=False)
-    # Out-of-bar labels for bonus series only (cheaper rendering)
-    for tr in fig_bar.data:
-        if tr.name == "Bonus Received":
-            tr.text = [f"{v:,.0f}" for v in tr.x]
-            tr.textposition = "outside"
-            tr.texttemplate = "%{text}"
-            tr.textfont = dict(size=12)
-        else:
-            tr.text = None
-    st.plotly_chart(fig_bar, use_container_width=True)
-else:
-    st.info("No rows for bar chart.")
 
-st.divider()
+    st.subheader("Purchased vs Bonus — Top Products")
+    if not chart_df.empty:
+        m = chart_df.melt(
+            id_vars=["Label"],
+            value_vars=["Qty Purchased", "Bonus Received"],
+            var_name="Metric", value_name="Value"
+        )
+        fig_bar = px.bar(
+            m, y="Label", x="Value", color="Metric",
+            orientation="h", height=max(420, 30 * len(chart_df))
+        )
+        fig_bar.update_layout(
+            yaxis=dict(categoryorder="total ascending", automargin=True),
+            legend_title="", bargap=0.15,
+            margin=dict(l=10, r=60, t=30, b=10)
+        )
+        fig_bar.update_traces(hovertemplate="%{y}<br>%{legendgroup}: %{x:,.0f}", cliponaxis=False)
+        for tr in fig_bar.data:
+            if tr.name == "Bonus Received":
+                tr.text = [f"{v:,.0f}" for v in tr.x]
+                tr.textposition = "outside"
+                tr.texttemplate = "%{text}"
+                tr.textfont = dict(size=12)
+            else:
+                tr.text = None
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    st.divider()
 
 # Highlights
 st.subheader("Highlights")
@@ -556,12 +563,11 @@ st.divider()
 
 # 🔎 SKU Drill-down (respects current filters)
 st.subheader("🔎 SKU Drill-down")
-
 agg_sorted = agg.sort_values(["Qty Purchased", "Product"], ascending=[False, True]).copy()
 agg_sorted["SKU"] = agg_sorted["Code"].astype(str) + " — " + agg_sorted["Product"].astype(str)
-sku_list = agg_sorted["SKU"].tolist()
+sku_list = ["(Choose a product)"] + agg_sorted["SKU"].tolist()
+selected_sku = st.selectbox("Select a product to view its purchase history:", sku_list, index=0)
 
-selected_sku = st.selectbox("Select a product to view its purchase history:", ["(Choose a product)"] + sku_list, index=0)
 if selected_sku != "(Choose a product)":
     row = agg_sorted.loc[agg_sorted["SKU"] == selected_sku].iloc[0]
     sel_code, sel_product = row["Code"], row["Product"]
@@ -582,7 +588,10 @@ if selected_sku != "(Choose a product)":
         hist["Date"] = hist["Date"].dt.strftime(DATE_FMT_DISPLAY)
 
     st.markdown(f"**{selected_sku}** — history in selected filters")
-    if len(hist) > 0 and "_sort_date" in hist:
+
+    # Only draw chart if SHOW_CHARTS
+    if SHOW_CHARTS and len(hist) > 0 and "_sort_date" in hist:
+        import plotly.express as px  # lazy
         trend = hist.sort_values("_sort_date")
         fig_hist = px.line(
             trend,
